@@ -6,7 +6,7 @@ Hodor is a tiny Rust reverse proxy that gates any web app behind a single shared
 
 ## Architecture
 
-Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.rs`, with the default login page in `src/template.html`.
+Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.rs`, with the default templates in `src/template.html` (login page) and `src/error_template.html` (error page).
 
 ### Request Flow
 
@@ -22,7 +22,7 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 - **AppState**: shared runtime state (config-derived values, rate limiter, HTTP client)
 - **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET
 - **Rate limiter**: in-memory `HashMap<IpAddr, Vec<Instant>>` behind `Arc<Mutex<_>>`, 5 attempts per 60s per IP
-- **Template system**: Jinja2 templates via minijinja. Built-in template in `src/template.html` (embedded via `include_str!`). Custom templates via `TEMPLATE` config. Variables: `title`, `show_error`.
+- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config. Login variables: `title`, `show_error`. Error variables: `title`, `status_code`, `heading`, `message`.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 
 ### Dependencies
@@ -60,7 +60,8 @@ docker compose up                  # runs with traefik/whoami as example upstrea
 ## CI/CD
 
 - `.github/workflows/ci.yml` — cargo test + fmt + clippy + hadolint (on push/PR)
-- `.github/workflows/release.yml` — Docker build + push to ghcr.io on `v*` tag
+- `.github/workflows/bump-version.yml` — manual dispatch: bumps `Cargo.toml` version via `cargo set-version`, commits, and pushes `vX.Y.Z` tag
+- `.github/workflows/release.yml` — triggered by `v*` tag: generates changelog via git-cliff (`cliff.toml`), builds multi-arch Docker image + pushes to ghcr.io, creates GitHub release with changelog
 - `.github/workflows/pr-title.yml` — conventional commit PR title enforcement
 
 ## Code Conventions

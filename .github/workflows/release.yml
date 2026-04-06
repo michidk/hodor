@@ -9,26 +9,33 @@ permissions:
   contents: write
   packages: write
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  create-release:
-    name: Create release
+  changelog:
+    name: Generate changelog
     runs-on: ubuntu-24.04
+    outputs:
+      release_body: ${{ steps.git-cliff.outputs.content }}
     steps:
-      - name: Create release
-        uses: mikepenz/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+      - uses: actions/checkout@v6
         with:
-          name: ${{ github.ref_name }}
-          draft: true
-          generate_release_notes: true
+          fetch-depth: 0
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   docker:
     name: Build & push Docker image
     runs-on: ubuntu-24.04
-    needs: [create-release]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -37,7 +44,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -67,3 +74,18 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-24.04
+    needs: [changelog, docker]
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ needs.changelog.outputs.release_body }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
