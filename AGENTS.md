@@ -6,7 +6,7 @@ Hodor is a tiny Rust reverse proxy that gates any web app behind a single shared
 
 ## Architecture
 
-Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.rs`.
+Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.rs`, with the default login page in `src/template.html`.
 
 ### Request Flow
 
@@ -14,25 +14,32 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 2. `/_gate/health` → bypass auth, return 200
 3. `/_gate/login` (POST) → rate-limit check → constant-time password compare → set session cookie
 4. `/_gate/logout` → clear cookie, redirect
-5. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, return login page HTML
+5. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, render login page via minijinja
 
 ### Key Components
 
-- **AppState**: shared config (password, template, secret, upstream, rate limiter, session settings)
-- **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET env var
+- **Config**: loaded via figment (defaults → `hodor.toml` → env vars). Defined as a `Config` struct with serde.
+- **AppState**: shared runtime state (config-derived values, rate limiter, HTTP client)
+- **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET
 - **Rate limiter**: in-memory `HashMap<IpAddr, Vec<Instant>>` behind `Arc<Mutex<_>>`, 5 attempts per 60s per IP
-- **Template system**: built-in HTML with `__TITLE__` placeholder and `display:none;` → `display:block;` error toggle. Custom HTML via `TEMPLATE` env var, loaded at startup.
+- **Template system**: Jinja2 templates via minijinja. Built-in template in `src/template.html` (embedded via `include_str!`). Custom templates via `TEMPLATE` config. Variables: `title`, `show_error`.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 
 ### Dependencies
 
-Minimal. stdlib + tokio/axum/hyper for HTTP, hmac/sha2/subtle for crypto, tracing for logging. No database, no ORM, no framework magic.
+- **HTTP**: tokio, axum, hyper, hyper-util, http, http-body-util
+- **Crypto**: hmac, sha2, subtle, hex, rand
+- **Config**: figment, serde
+- **Templates**: minijinja
+- **Logging**: tracing, tracing-subscriber
+
+No database, no ORM, no framework magic.
 
 ## Configuration
 
-All env vars. See README.md for the full table.
+Layered: defaults → `hodor.toml` → environment variables. See README.md for the full table.
 
-Required: `PASSWORD`, `UPSTREAM`. Everything else has defaults.
+Required: `password`/`PASSWORD`, `upstream`/`UPSTREAM`. Everything else has defaults.
 
 ## Build & Test
 
@@ -58,8 +65,8 @@ docker compose up                  # runs with traefik/whoami as example upstrea
 
 ## Code Conventions
 
-- Single file (`src/main.rs`) — keep it that way until it genuinely needs splitting
+- Single file (`src/main.rs`) + template (`src/template.html`) — keep it that way until it genuinely needs splitting
 - No comments except for security protocol documentation and non-obvious behavior
 - No `unwrap()` in request handlers — proper error handling with `?` or match
-- `unwrap()` is OK in `main()` for fatal config errors
+- `unwrap()` / `.expect()` OK in `main()` for fatal config errors
 - No `unsafe`, no `#[allow(...)]`
