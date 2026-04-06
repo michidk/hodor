@@ -10,4 +10,5 @@ RUN touch src/main.rs && cargo build --release
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /src/target/release/hodor /hodor
+EXPOSE 8080
 ENTRYPOINT ["/hodor"]

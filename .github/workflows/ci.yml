@@ -8,6 +8,7 @@ on:
       - "rust-toolchain.toml"
       - "src/**"
       - "Dockerfile"
+      - ".github/workflows/ci.yml"
   pull_request:
     paths:
       - "Cargo.lock"
@@ -15,6 +16,7 @@ on:
       - "rust-toolchain.toml"
       - "src/**"
       - "Dockerfile"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_INCREMENTAL: 0
@@ -67,6 +69,19 @@ jobs:
 
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
 
   hadolint:
     name: Hadolint

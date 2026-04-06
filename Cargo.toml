@@ -6,6 +6,7 @@ authors = ["Michael Lohr <michael@lohr.dev>"]
 description = "A tiny reverse proxy that gates any app behind a shared password"
 repository = "https://github.com/michidk/hodor"
 license = "MIT"
+rust-version = "1.85"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

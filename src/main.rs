@@ -32,8 +32,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "hodor";
 const BUILTIN_TEMPLATE: &str = include_str!("template.html");
+const BUILTIN_ERROR_TEMPLATE: &str = include_str!("error_template.html");
 const RATE_LIMIT_ATTEMPTS: usize = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const ERROR_TEMPLATE_NAME: &str = "error.html";
 const TEMPLATE_NAME: &str = "login.html";
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
@@ -43,6 +45,7 @@ struct AppState {
     password: Vec<u8>,
     title: String,
     template_source: String,
+    error_template_source: String,
     secret: Vec<u8>,
     upstream: Uri,
     upstream_scheme: String,
@@ -65,6 +68,8 @@ struct Config {
     #[serde(default)]
     template: Option<String>,
     #[serde(default)]
+    error_template: Option<String>,
+    #[serde(default)]
     secret: Option<String>,
     #[serde(default = "default_session_ttl")]
     session_ttl: u64,
@@ -82,6 +87,7 @@ impl Default for Config {
             listen: default_listen(),
             title: default_title(),
             template: None,
+            error_template: None,
             secret: None,
             session_ttl: default_session_ttl(),
             secure_cookie: false,
@@ -111,6 +117,9 @@ async fn main() {
     let listen_addr = parse_listen_addr(&config.listen);
     let template_source = load_template(config.template.as_deref());
     validate_template(&template_source, &config.title).expect("template must parse and render");
+    let error_template_source = load_error_template(config.error_template.as_deref());
+    validate_error_template(&error_template_source, &config.title)
+        .expect("error template must parse and render");
     let secret = load_secret(config.secret.as_deref());
 
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
@@ -118,6 +127,7 @@ async fn main() {
         password: config.password.into_bytes(),
         title: config.title,
         template_source,
+        error_template_source,
         secret,
         upstream,
         upstream_scheme,
@@ -133,6 +143,7 @@ async fn main() {
         listen_addr = %listen_addr,
         upstream = %state.upstream,
         custom_template_loaded = config.template.is_some(),
+        custom_error_template_loaded = config.error_template.is_some(),
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
         log_format = %config.log_format,
@@ -173,7 +184,7 @@ async fn logout(State(state): State<AppState>) -> Response<Body> {
             response.headers_mut().insert(SET_COOKIE, value);
             response
         }
-        Err(_) => internal_server_error(),
+        Err(_) => internal_server_error(&state),
     }
 }
 
@@ -213,7 +224,7 @@ async fn login_post(
             response.headers_mut().insert(SET_COOKIE, value);
             response
         }
-        Err(_) => internal_server_error(),
+        Err(_) => internal_server_error(&state),
     }
 }
 
@@ -246,7 +257,7 @@ async fn proxy_request(
 
     if is_websocket_upgrade(&parts.headers) {
         debug!(method = %request_method, path = %request_path, client_ip = %addr.ip(), "websocket upgrade requested but not supported");
-        return websocket_not_supported();
+        return websocket_not_supported(&state);
     }
 
     let path = join_paths(&state.upstream_base_path, parts.uri.path());
@@ -254,7 +265,7 @@ async fn proxy_request(
 
     let mut proxied = match Request::builder().method(parts.method).uri(uri).body(body) {
         Ok(request) => request,
-        Err(_) => return bad_gateway(),
+        Err(_) => return bad_gateway(&state),
     };
 
     *proxied.version_mut() = parts.version;
@@ -269,14 +280,14 @@ async fn proxy_request(
         Ok(host) => {
             proxied.headers_mut().insert(HOST, host);
         }
-        Err(_) => return bad_gateway(),
+        Err(_) => return bad_gateway(&state),
     }
 
     append_forwarded_headers(proxied.headers_mut(), addr.ip());
 
     let response = match state.client.request(proxied).await {
         Ok(response) => response,
-        Err(_) => return bad_gateway(),
+        Err(_) => return bad_gateway(&state),
     };
 
     let (parts, body) = response.into_parts();
@@ -290,7 +301,7 @@ async fn proxy_request(
             }
         }
     } else {
-        return bad_gateway();
+        return bad_gateway(&state);
     }
 
     match builder.body(Body::new(body)) {
@@ -304,7 +315,7 @@ async fn proxy_request(
             );
             response
         }
-        Err(_) => bad_gateway(),
+        Err(_) => bad_gateway(&state),
     }
 }
 
@@ -325,8 +336,27 @@ fn load_template(template_path: Option<&str>) -> String {
     }
 }
 
+fn load_error_template(template_path: Option<&str>) -> String {
+    match template_path {
+        Some(path) => std::fs::read_to_string(path)
+            .expect("failed to read custom error template from ERROR_TEMPLATE path"),
+        None => BUILTIN_ERROR_TEMPLATE.to_string(),
+    }
+}
+
 fn validate_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
     render_login_page(template_source, title, false).map(|_| ())
+}
+
+fn validate_error_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
+    render_error_page(
+        template_source,
+        title,
+        StatusCode::BAD_GATEWAY,
+        "Bad Gateway",
+        "The upstream service could not be reached.",
+    )
+    .map(|_| ())
 }
 
 fn render_login_page(
@@ -340,12 +370,50 @@ fn render_login_page(
         .render(context!(title => title, show_error => show_error))
 }
 
+fn render_error_page(
+    template_source: &str,
+    title: &str,
+    status: StatusCode,
+    heading: &str,
+    message: &str,
+) -> Result<String, minijinja::Error> {
+    let mut env = Environment::new();
+    env.add_template(ERROR_TEMPLATE_NAME, template_source)?;
+    env.get_template(ERROR_TEMPLATE_NAME)?.render(context!(
+        title => title,
+        status_code => status.as_u16(),
+        heading => heading,
+        message => message,
+    ))
+}
+
 fn login_page_response(template_source: &str, title: &str, show_error: bool) -> Response<Body> {
     match render_login_page(template_source, title, show_error) {
         Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
         Err(error) => {
             warn!(%error, "failed to render login page");
-            internal_server_error()
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+fn error_page_response(
+    state: &AppState,
+    status: StatusCode,
+    heading: &str,
+    message: &str,
+) -> Response<Body> {
+    match render_error_page(
+        &state.error_template_source,
+        &state.title,
+        status,
+        heading,
+        message,
+    ) {
+        Ok(page) => (status, Html(page)).into_response(),
+        Err(error) => {
+            warn!(%error, "failed to render error page");
+            (status, message.to_string()).into_response()
         }
     }
 }
@@ -672,18 +740,479 @@ fn default_log_format() -> String {
     "compact".to_string()
 }
 
-fn internal_server_error() -> Response<Body> {
-    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
-}
-
-fn bad_gateway() -> Response<Body> {
-    (StatusCode::BAD_GATEWAY, "bad gateway").into_response()
-}
-
-fn websocket_not_supported() -> Response<Body> {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "websocket proxying is not supported yet",
+fn internal_server_error(state: &AppState) -> Response<Body> {
+    error_page_response(
+        state,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal Server Error",
+        "Something went wrong while processing this request.",
     )
-        .into_response()
+}
+
+fn bad_gateway(state: &AppState) -> Response<Body> {
+    error_page_response(
+        state,
+        StatusCode::BAD_GATEWAY,
+        "Upstream Unavailable",
+        "Hodor is running, but the downstream service could not be reached.",
+    )
+}
+
+fn websocket_not_supported(state: &AppState) -> Response<Body> {
+    error_page_response(
+        state,
+        StatusCode::NOT_IMPLEMENTED,
+        "WebSockets Not Supported",
+        "This hodor instance does not support WebSocket proxying yet.",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_secret() -> Vec<u8> {
+        b"test-secret-key-for-unit-tests".to_vec()
+    }
+
+    fn test_state(secure_cookie: bool) -> AppState {
+        AppState {
+            password: b"hunter2".to_vec(),
+            title: "Test".to_string(),
+            template_source: BUILTIN_TEMPLATE.to_string(),
+            error_template_source: BUILTIN_ERROR_TEMPLATE.to_string(),
+            secret: test_secret(),
+            upstream: "http://localhost:3000".parse().unwrap(),
+            upstream_scheme: "http".to_string(),
+            upstream_authority: "localhost:3000".to_string(),
+            upstream_base_path: String::new(),
+            session_ttl: Duration::from_secs(3600),
+            secure_cookie,
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
+        }
+    }
+
+    #[test]
+    fn sign_and_validate_token_roundtrip() {
+        let secret = test_secret();
+        let expiry = now_unix() + 3600;
+        let token = sign_token(&secret, expiry);
+        assert!(validate_token(&secret, &token));
+    }
+
+    #[test]
+    fn validate_token_rejects_expired() {
+        let secret = test_secret();
+        let token = sign_token(&secret, 0);
+        assert!(!validate_token(&secret, &token));
+    }
+
+    #[test]
+    fn validate_token_rejects_tampered_signature() {
+        let secret = test_secret();
+        let expiry = now_unix() + 3600;
+        let token = sign_token(&secret, expiry);
+        let tampered = format!("{expiry}|deadbeef");
+        assert!(!validate_token(&secret, &tampered));
+        assert!(validate_token(&secret, &token));
+    }
+
+    #[test]
+    fn validate_token_rejects_wrong_secret() {
+        let secret = test_secret();
+        let expiry = now_unix() + 3600;
+        let token = sign_token(&secret, expiry);
+        assert!(!validate_token(b"wrong-secret", &token));
+    }
+
+    #[test]
+    fn validate_token_rejects_malformed() {
+        let secret = test_secret();
+        assert!(!validate_token(&secret, "no-pipe-separator"));
+        assert!(!validate_token(&secret, "notanumber|abcdef"));
+        assert!(!validate_token(&secret, "|"));
+        assert!(!validate_token(&secret, ""));
+        assert!(!validate_token(&secret, "123|not-hex!@#"));
+    }
+
+    #[test]
+    fn sanitize_redirect_allows_relative_paths() {
+        assert_eq!(sanitize_redirect("/"), "/");
+        assert_eq!(sanitize_redirect("/dashboard"), "/dashboard");
+        assert_eq!(sanitize_redirect("/a/b?q=1"), "/a/b?q=1");
+    }
+
+    #[test]
+    fn sanitize_redirect_blocks_open_redirects() {
+        assert_eq!(sanitize_redirect("//evil.com"), "/");
+        assert_eq!(sanitize_redirect("https://evil.com"), "/");
+        assert_eq!(sanitize_redirect("javascript:alert(1)"), "/");
+        assert_eq!(sanitize_redirect(""), "/");
+        assert_eq!(sanitize_redirect("relative"), "/");
+    }
+
+    #[test]
+    fn parse_form_body_basic() {
+        let body = Bytes::from("password=hunter2&redirect=%2Fdashboard");
+        let form = parse_form_body(&body);
+        assert_eq!(form_value(&form, "password"), Some("hunter2"));
+        assert_eq!(form_value(&form, "redirect"), Some("/dashboard"));
+    }
+
+    #[test]
+    fn parse_form_body_empty() {
+        let body = Bytes::from("");
+        let form = parse_form_body(&body);
+        assert!(form.is_empty());
+    }
+
+    #[test]
+    fn form_value_missing_key() {
+        let body = Bytes::from("a=1");
+        let form = parse_form_body(&body);
+        assert_eq!(form_value(&form, "b"), None);
+    }
+
+    #[test]
+    fn decode_form_component_plain() {
+        assert_eq!(decode_form_component("hello"), "hello");
+    }
+
+    #[test]
+    fn decode_form_component_plus_to_space() {
+        assert_eq!(decode_form_component("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn decode_form_component_percent_encoding() {
+        assert_eq!(decode_form_component("%2Fdashboard"), "/dashboard");
+        assert_eq!(decode_form_component("100%25"), "100%");
+    }
+
+    #[test]
+    fn decode_form_component_mixed() {
+        assert_eq!(decode_form_component("a+b%3Dc"), "a b=c");
+    }
+
+    #[test]
+    fn decode_form_component_incomplete_percent() {
+        assert_eq!(decode_form_component("100%"), "100%");
+        assert_eq!(decode_form_component("100%2"), "100%2");
+    }
+
+    #[test]
+    fn cookie_value_finds_named_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("hodor=abc123; other=xyz"));
+        assert_eq!(cookie_value(&headers, "hodor"), Some("abc123"));
+        assert_eq!(cookie_value(&headers, "other"), Some("xyz"));
+    }
+
+    #[test]
+    fn cookie_value_returns_none_when_missing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("other=xyz"));
+        assert_eq!(cookie_value(&headers, "hodor"), None);
+    }
+
+    #[test]
+    fn cookie_value_returns_none_without_cookie_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(cookie_value(&headers, "hodor"), None);
+    }
+
+    #[test]
+    fn join_paths_empty_base() {
+        assert_eq!(join_paths("", "/foo"), "/foo");
+    }
+
+    #[test]
+    fn join_paths_root_base() {
+        assert_eq!(join_paths("/", "/foo"), "/foo");
+    }
+
+    #[test]
+    fn join_paths_base_with_root_path() {
+        assert_eq!(join_paths("/api", "/"), "/api");
+    }
+
+    #[test]
+    fn join_paths_base_with_subpath() {
+        assert_eq!(join_paths("/api", "/users"), "/api/users");
+        assert_eq!(join_paths("/api/", "/users"), "/api/users");
+        assert_eq!(join_paths("/api", "users"), "/api/users");
+    }
+
+    #[test]
+    fn parse_listen_addr_port_only() {
+        let addr = parse_listen_addr(":9090");
+        assert_eq!(addr.port(), 9090);
+        assert_eq!(addr.ip(), IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn parse_listen_addr_full() {
+        let addr = parse_listen_addr("127.0.0.1:8080");
+        assert_eq!(addr.port(), 8080);
+        assert_eq!(addr.ip(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn is_hop_by_hop_header_detects_correctly() {
+        assert!(is_hop_by_hop_header(&HeaderName::from_static("connection")));
+        assert!(is_hop_by_hop_header(&HeaderName::from_static(
+            "transfer-encoding"
+        )));
+        assert!(is_hop_by_hop_header(&HeaderName::from_static("upgrade")));
+        assert!(!is_hop_by_hop_header(&HeaderName::from_static(
+            "content-type"
+        )));
+        assert!(!is_hop_by_hop_header(&HeaderName::from_static(
+            "authorization"
+        )));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_detects_correctly() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        assert!(is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_rejects_missing_upgrade_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_rejects_missing_connection_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_rejects_non_websocket() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, HeaderValue::from_static("h2c"));
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn allow_login_attempt_permits_first_attempts() {
+        let state = test_state(false);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..RATE_LIMIT_ATTEMPTS {
+            assert!(allow_login_attempt(&state, ip));
+        }
+    }
+
+    #[test]
+    fn allow_login_attempt_blocks_after_limit() {
+        let state = test_state(false);
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        for _ in 0..RATE_LIMIT_ATTEMPTS {
+            allow_login_attempt(&state, ip);
+        }
+        assert!(!allow_login_attempt(&state, ip));
+    }
+
+    #[test]
+    fn allow_login_attempt_isolates_ips() {
+        let state = test_state(false);
+        let ip1: IpAddr = "10.0.0.3".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.4".parse().unwrap();
+        for _ in 0..RATE_LIMIT_ATTEMPTS {
+            allow_login_attempt(&state, ip1);
+        }
+        assert!(!allow_login_attempt(&state, ip1));
+        assert!(allow_login_attempt(&state, ip2));
+    }
+
+    #[test]
+    fn session_cookie_contains_expected_parts() {
+        let state = test_state(false);
+        let cookie = session_cookie(&state, "token123");
+        assert!(cookie.contains("hodor=token123"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=3600"));
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn session_cookie_includes_secure_flag() {
+        let state = test_state(true);
+        let cookie = session_cookie(&state, "token123");
+        assert!(cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn clear_cookie_sets_max_age_zero() {
+        let state = test_state(false);
+        let cookie = clear_cookie(&state);
+        assert!(cookie.contains("hodor="));
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_cookie_includes_secure_flag() {
+        let state = test_state(true);
+        let cookie = clear_cookie(&state);
+        assert!(cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn build_upstream_uri_basic() {
+        let state = test_state(false);
+        let uri = build_upstream_uri(&state, "/foo", None);
+        assert_eq!(uri.to_string(), "http://localhost:3000/foo");
+    }
+
+    #[test]
+    fn build_upstream_uri_with_query() {
+        let state = test_state(false);
+        let uri = build_upstream_uri(&state, "/foo", Some("bar=1"));
+        assert_eq!(uri.to_string(), "http://localhost:3000/foo?bar=1");
+    }
+
+    #[test]
+    fn is_authenticated_with_valid_cookie() {
+        let secret = test_secret();
+        let expiry = now_unix() + 3600;
+        let token = sign_token(&secret, expiry);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("hodor={token}")).unwrap(),
+        );
+        assert!(is_authenticated(&headers, &secret));
+    }
+
+    #[test]
+    fn is_authenticated_rejects_no_cookie() {
+        let secret = test_secret();
+        let headers = HeaderMap::new();
+        assert!(!is_authenticated(&headers, &secret));
+    }
+
+    #[test]
+    fn is_authenticated_rejects_expired_cookie() {
+        let secret = test_secret();
+        let token = sign_token(&secret, 0);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("hodor={token}")).unwrap(),
+        );
+        assert!(!is_authenticated(&headers, &secret));
+    }
+
+    #[test]
+    fn append_forwarded_headers_sets_headers() {
+        let mut headers = HeaderMap::new();
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        append_forwarded_headers(&mut headers, ip);
+        assert_eq!(
+            headers
+                .get(X_FORWARDED_FOR_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "192.168.1.1"
+        );
+        assert_eq!(
+            headers
+                .get(X_FORWARDED_PROTO_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "http"
+        );
+    }
+
+    #[test]
+    fn append_forwarded_headers_appends_to_existing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_FOR_HEADER),
+            HeaderValue::from_static("10.0.0.1"),
+        );
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        append_forwarded_headers(&mut headers, ip);
+        assert_eq!(
+            headers
+                .get(X_FORWARDED_FOR_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "10.0.0.1, 192.168.1.1"
+        );
+    }
+
+    #[test]
+    fn validate_template_accepts_builtin() {
+        assert!(validate_template(BUILTIN_TEMPLATE, "Test").is_ok());
+    }
+
+    #[test]
+    fn validate_template_rejects_invalid_syntax() {
+        assert!(validate_template("{% invalid %}", "Test").is_err());
+    }
+
+    #[test]
+    fn validate_error_template_accepts_builtin() {
+        assert!(validate_error_template(BUILTIN_ERROR_TEMPLATE, "Test").is_ok());
+    }
+
+    #[test]
+    fn validate_error_template_rejects_invalid_syntax() {
+        assert!(validate_error_template("{% invalid %}", "Test").is_err());
+    }
+
+    #[test]
+    fn render_login_page_includes_title() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", false).unwrap();
+        assert!(html.contains("My Gate"));
+    }
+
+    #[test]
+    fn render_login_page_escapes_title() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", false).unwrap();
+        assert!(!html.contains("<script>xss</script>"));
+    }
+
+    #[test]
+    fn render_error_page_includes_fields() {
+        let html = render_error_page(
+            BUILTIN_ERROR_TEMPLATE,
+            "My Gate",
+            StatusCode::BAD_GATEWAY,
+            "Upstream Unavailable",
+            "The downstream service could not be reached.",
+        )
+        .unwrap();
+        assert!(html.contains("My Gate"));
+        assert!(html.contains("502"));
+        assert!(html.contains("Upstream Unavailable"));
+        assert!(html.contains("The downstream service could not be reached."));
+    }
+
+    #[test]
+    fn render_error_page_escapes_title() {
+        let html = render_error_page(
+            BUILTIN_ERROR_TEMPLATE,
+            "<script>xss</script>",
+            StatusCode::BAD_GATEWAY,
+            "Bad Gateway",
+            "Oops",
+        )
+        .unwrap();
+        assert!(!html.contains("<script>xss</script>"));
+    }
 }
