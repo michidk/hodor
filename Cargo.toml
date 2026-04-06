@@ -1,0 +1,20 @@
+[package]
+name = "hodor"
+version = "0.1.0"
+edition = "2024"
+authors = ["Michael Lohr <michael@lohr.dev>"]
+description = "A tiny reverse proxy that gates any app behind a shared password"
+repository = "https://github.com/michidk/hodor"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+axum = "0.8"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+http = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+http-body-util = "0.1"
