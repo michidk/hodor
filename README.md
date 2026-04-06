@@ -27,9 +27,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PASSWORD: "changeme"
+      PASSWORD: "changeme"                          # the login password
       UPSTREAM: "http://app:80"
-      SECRET: "replace-with-openssl-rand-hex-32"
+      SECRET: "changeme"                              # signs session cookies (generate with: openssl rand -hex 32)
     depends_on:
       - app
 
@@ -75,7 +75,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 # hodor.toml
 password = "changeme"
 upstream = "http://app:3000"
-secret = "replace-with-openssl-rand-hex-32"
+secret = "changeme" # generate with: openssl rand -hex 32
 title = "Restricted Area"
 session_ttl = 3600
 secure_cookie = true
