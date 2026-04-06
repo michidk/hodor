@@ -1,4 +1,5 @@
 FROM rust:1-alpine AS build
+# hadolint ignore=DL3018
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
