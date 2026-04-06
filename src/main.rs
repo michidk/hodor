@@ -1,7 +1,9 @@
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::header::{COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, SET_COOKIE};
+use axum::extract::{ConnectInfo, State};
+use axum::http::header::{
+    CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, UPGRADE,
+};
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
@@ -13,14 +15,24 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rand::RngCore;
 use sha2::Sha256;
-use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
+use tokio::signal::unix::{SignalKind, signal};
+use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "hodor";
-const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
+const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+const RATE_LIMIT_ATTEMPTS: usize = 5;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+const DEFAULT_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -114,24 +126,33 @@ const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
 
 #[derive(Clone)]
 struct AppState {
-    password: String,
-    title: String,
+    password: Vec<u8>,
+    template: String,
     secret: Vec<u8>,
     upstream: Uri,
     upstream_scheme: String,
     upstream_authority: String,
     upstream_base_path: String,
+    session_ttl: Duration,
+    secure_cookie: bool,
+    rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
     client: Client<HttpConnector, Body>,
 }
 
 #[tokio::main]
 async fn main() {
-    let password = std::env::var("PASSWORD").unwrap();
-    let upstream = std::env::var("UPSTREAM").unwrap();
+    init_tracing();
+
+    let password = std::env::var("PASSWORD").unwrap().into_bytes();
+    let upstream_raw = std::env::var("UPSTREAM").unwrap();
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| ":8080".to_string());
     let title = std::env::var("TITLE").unwrap_or_else(|_| "Password Required".to_string());
+    let template_path = std::env::var("TEMPLATE").ok();
+    let template = load_template(&title, template_path.as_deref());
+    let session_ttl = Duration::from_secs(parse_session_ttl());
+    let secure_cookie = parse_secure_cookie();
 
-    let upstream: Uri = upstream.parse().unwrap();
+    let upstream: Uri = upstream_raw.parse().unwrap();
     let upstream_scheme = upstream.scheme_str().unwrap().to_string();
     let upstream_authority = upstream.authority().unwrap().to_string();
     let upstream_base_path = upstream.path().trim_end_matches('/').to_string();
@@ -141,39 +162,75 @@ async fn main() {
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
         password,
-        title,
+        template,
         secret,
         upstream,
         upstream_scheme,
         upstream_authority,
         upstream_base_path,
+        session_ttl,
+        secure_cookie,
+        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         client,
     };
+
+    info!(
+        listen_addr = %listen_addr,
+        upstream = %upstream_raw,
+        custom_template_loaded = template_path.is_some(),
+        session_ttl_secs = state.session_ttl.as_secs(),
+        secure_cookie = state.secure_cookie,
+        "starting hodor"
+    );
 
     let app = Router::new()
         .route("/_gate/login", get(login_get).post(login_post))
         .route("/_gate/logout", get(logout))
+        .route("/_gate/health", get(health))
         .fallback(proxy_or_login)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap();
 }
 
 async fn login_get() -> impl IntoResponse {
     Redirect::to("/")
 }
 
-async fn logout() -> Response<Body> {
-    let mut response = Redirect::to("/").into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_static("hodor=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
-    );
-    response
+async fn health() -> &'static str {
+    "ok"
 }
 
-async fn login_post(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+async fn logout(State(state): State<AppState>) -> Response<Body> {
+    let mut response = Redirect::to("/").into_response();
+    match HeaderValue::from_str(&clear_cookie(&state)) {
+        Ok(value) => {
+            response.headers_mut().insert(SET_COOKIE, value);
+            response
+        }
+        Err(_) => internal_server_error(),
+    }
+}
+
+async fn login_post(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let client_ip = addr.ip();
+
+    if !allow_login_attempt(&state, client_ip) {
+        info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many login attempts").into_response();
+    }
+
     let body = match collect_body(request.into_body()).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -183,19 +240,18 @@ async fn login_post(State(state): State<AppState>, request: Request<Body>) -> Re
     let redirect = sanitize_redirect(form_value(&form, "redirect").unwrap_or("/"));
     let password = form_value(&form, "password").unwrap_or("");
 
-    if password != state.password {
-        return login_page_response(&state.title, true);
+    if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
+        info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
+        return login_page_response(&state.template, true);
     }
 
-    let token = sign_token(&state.secret, now_unix() + SESSION_TTL.as_secs());
-    let cookie = format!(
-        "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
-        SESSION_TTL.as_secs()
-    );
+    let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
+    let cookie = session_cookie(&state, &token);
 
     let mut response = Redirect::to(&redirect).into_response();
     match HeaderValue::from_str(&cookie) {
         Ok(value) => {
+            info!(client_ip = %client_ip, success = true, rate_limited = false, "login attempt");
             response.headers_mut().insert(SET_COOKIE, value);
             response
         }
@@ -203,29 +259,42 @@ async fn login_post(State(state): State<AppState>, request: Request<Body>) -> Re
     }
 }
 
-async fn proxy_or_login(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+async fn proxy_or_login(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
     if !is_authenticated(request.headers(), &state.secret) {
-        return login_page_response(&state.title, false);
+        return login_page_response(&state.template, false);
     }
 
-    proxy_request(state, request).await
+    proxy_request(state, addr, request).await
 }
 
-async fn proxy_request(state: AppState, request: Request<Body>) -> Response<Body> {
+async fn proxy_request(
+    state: AppState,
+    addr: SocketAddr,
+    request: Request<Body>,
+) -> Response<Body> {
+    let started_at = Instant::now();
+    let request_method = request.method().clone();
+    let request_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+
     let (parts, body) = request.into_parts();
-    let body = match collect_body(body).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+
+    if is_websocket_upgrade(&parts.headers) {
+        debug!(method = %request_method, path = %request_path, client_ip = %addr.ip(), "websocket upgrade requested but not supported");
+        return websocket_not_supported();
+    }
 
     let path = join_paths(&state.upstream_base_path, parts.uri.path());
     let uri = build_upstream_uri(&state, &path, parts.uri.query());
 
-    let mut proxied = match Request::builder()
-        .method(parts.method)
-        .uri(uri)
-        .body(Body::from(body))
-    {
+    let mut proxied = match Request::builder().method(parts.method).uri(uri).body(body) {
         Ok(request) => request,
         Err(_) => return bad_gateway(),
     };
@@ -245,18 +314,17 @@ async fn proxy_request(state: AppState, request: Request<Body>) -> Response<Body
         Err(_) => return bad_gateway(),
     }
 
+    append_forwarded_headers(proxied.headers_mut(), addr.ip());
+
     let response = match state.client.request(proxied).await {
         Ok(response) => response,
         Err(_) => return bad_gateway(),
     };
 
     let (parts, body) = response.into_parts();
-    let body = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return bad_gateway(),
-    };
+    let status = parts.status;
 
-    let mut builder = Response::builder().status(parts.status);
+    let mut builder = Response::builder().status(status);
     if let Some(headers) = builder.headers_mut() {
         for (name, value) in &parts.headers {
             if !is_hop_by_hop_header(name) {
@@ -267,27 +335,28 @@ async fn proxy_request(state: AppState, request: Request<Body>) -> Response<Body
         return bad_gateway();
     }
 
-    match builder.body(Body::from(body)) {
-        Ok(response) => response,
+    match builder.body(Body::new(body)) {
+        Ok(response) => {
+            info!(
+                method = %request_method,
+                path = %request_path,
+                status = status.as_u16(),
+                duration_ms = started_at.elapsed().as_millis(),
+                "proxied request"
+            );
+            response
+        }
         Err(_) => bad_gateway(),
     }
 }
 
-fn login_page_response(title: &str, show_error: bool) -> Response<Body> {
-    (
-        StatusCode::UNAUTHORIZED,
-        Html(render_login_page(title, show_error)),
-    )
-        .into_response()
-}
-
-fn render_login_page(title: &str, show_error: bool) -> String {
-    let page = LOGIN_PAGE.replace("__TITLE__", &escape_html(title));
-    if show_error {
-        page.replacen("display:none;", "display:block;", 1)
+fn login_page_response(template: &str, show_error: bool) -> Response<Body> {
+    let page = if show_error {
+        template.replacen("display:none;", "display:block;", 1)
     } else {
-        page
-    }
+        template.to_string()
+    };
+    (StatusCode::UNAUTHORIZED, Html(page)).into_response()
 }
 
 fn is_authenticated(headers: &HeaderMap, secret: &[u8]) -> bool {
@@ -312,6 +381,66 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     None
 }
 
+fn allow_login_attempt(state: &AppState, ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let cutoff = now.checked_sub(RATE_LIMIT_WINDOW).unwrap_or(now);
+    let mut limiter = state
+        .rate_limiter
+        .lock()
+        .expect("rate limiter lock poisoned");
+
+    limiter.retain(|_, attempts| {
+        attempts.retain(|attempt| *attempt >= cutoff);
+        !attempts.is_empty()
+    });
+
+    let attempts = limiter.entry(ip).or_default();
+    if attempts.len() >= RATE_LIMIT_ATTEMPTS {
+        return false;
+    }
+
+    attempts.push(now);
+    true
+}
+
+fn session_cookie(state: &AppState, token: &str) -> String {
+    let mut cookie = format!(
+        "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        state.session_ttl.as_secs()
+    );
+    if state.secure_cookie {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn clear_cookie(state: &AppState) -> String {
+    let mut cookie = format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    if state.secure_cookie {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn append_forwarded_headers(headers: &mut HeaderMap, client_ip: IpAddr) {
+    let forwarded_for = match headers
+        .get(HeaderName::from_static(X_FORWARDED_FOR_HEADER))
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}, {client_ip}"),
+        _ => client_ip.to_string(),
+    };
+
+    if let Ok(value) = HeaderValue::from_str(&forwarded_for) {
+        headers.insert(HeaderName::from_static(X_FORWARDED_FOR_HEADER), value);
+    }
+    headers.insert(
+        HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+        HeaderValue::from_static("http"),
+    );
+}
+
+// Token format: `<unix_expiry>|<hex_hmac_sha256(expiry)>` so expiry stays inspectable while integrity remains signed.
 fn sign_token(secret: &[u8], expiry: u64) -> String {
     let expiry = expiry.to_string();
     let mut mac = HmacSha256::new_from_slice(secret).expect("valid HMAC key");
@@ -351,10 +480,31 @@ fn load_secret() -> Vec<u8> {
         Err(_) => {
             let mut secret = [0_u8; 32];
             rand::thread_rng().fill_bytes(&mut secret);
-            eprintln!("warning: SECRET not set, generated ephemeral signing key");
+            warn!("SECRET not set, generated ephemeral signing key");
             secret.to_vec()
         }
     }
+}
+
+fn load_template(title: &str, template_path: Option<&str>) -> String {
+    let raw = match template_path {
+        Some(path) => std::fs::read_to_string(path).unwrap(),
+        None => DEFAULT_TEMPLATE.to_string(),
+    };
+
+    raw.replace("__TITLE__", &escape_html(title))
+}
+
+fn parse_session_ttl() -> u64 {
+    std::env::var("SESSION_TTL")
+        .map(|value| value.parse::<u64>().unwrap())
+        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
+}
+
+fn parse_secure_cookie() -> bool {
+    std::env::var("SECURE_COOKIE")
+        .map(|value| value.parse::<bool>().unwrap())
+        .unwrap_or(false)
 }
 
 fn parse_listen_addr(listen: &str) -> SocketAddr {
@@ -472,6 +622,25 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     )
 }
 
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let has_upgrade_connection = headers
+        .get(CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+    let is_websocket = headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    has_upgrade_connection && is_websocket
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -486,10 +655,53 @@ async fn collect_body(body: Body) -> Result<Bytes, Response<Body>> {
     }
 }
 
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "compact".to_string());
+
+    if format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .compact()
+            .init();
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.unwrap();
+    };
+
+    let terminate = async {
+        signal(SignalKind::terminate()).unwrap().recv().await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("shutdown signal received");
+}
+
 fn internal_server_error() -> Response<Body> {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
 }
 
 fn bad_gateway() -> Response<Body> {
     (StatusCode::BAD_GATEWAY, "bad gateway").into_response()
+}
+
+fn websocket_not_supported() -> Response<Body> {
+    // TODO: Implement bidirectional upgraded IO proxying for WebSocket support without regressing HTTP streaming behavior.
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "websocket proxying is not supported yet",
+    )
+        .into_response()
 }

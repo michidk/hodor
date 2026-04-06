@@ -8,7 +8,7 @@ repository = "https://github.com/michidk/hodor"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 axum = "0.8"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
@@ -18,3 +18,6 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 http-body-util = "0.1"
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
