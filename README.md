@@ -1,13 +1,11 @@
 # hodor
 
-[![MIT License](https://img.shields.io/github/license/michidk/hodor)](https://choosealicense.com/licenses/mit/) [![CI](https://github.com/michidk/hodor/actions/workflows/ci.yml/badge.svg)](https://github.com/michidk/hodor/actions/workflows/ci.yml)
-
 A tiny reverse proxy that holds the door — put it in front of any app to gate access behind a single shared password. No users, no database, no OAuth. Just one password and a login page.
 
 ## Features
 
 - Single shared password — no user accounts, no database
-- Clean dark-themed login page (or bring your own)
+- Clean dark-themed login page (or bring your own with Jinja2 templates)
 - Runs as a Docker sidecar in front of any web app
 - HMAC-SHA256 signed session cookies
 - Streaming reverse proxy (handles large uploads/downloads without buffering)
@@ -16,7 +14,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - Structured logging (compact or JSON)
 - Health check endpoint for container orchestrators
 - Graceful shutdown on SIGTERM
-- Zero config files — everything via environment variables
+- Layered config: defaults → `hodor.toml` → environment variables
 - Built with Rust, runs from a `scratch` image (~5MB)
 
 ## Quick Start
@@ -47,20 +45,40 @@ Open `http://localhost:8080` — you'll see the login page. Enter the password, 
 
 ## Configuration
 
-All configuration is via environment variables:
+Hodor uses layered configuration. Each layer overrides the previous:
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `PASSWORD` | yes | | The shared password |
-| `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`) |
-| `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
-| `LISTEN` | no | `:8080` | Listen address |
-| `TITLE` | no | `Password Required` | Login page heading |
-| `TEMPLATE` | no | built-in | Path to a custom HTML login page |
-| `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
-| `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
-| `LOG_FORMAT` | no | `compact` | Log output format: `compact` or `json` |
-| `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
+1. **Defaults** — sensible built-in values
+2. **`hodor.toml`** — optional config file in the working directory
+3. **Environment variables** — override everything (uppercase, e.g. `PASSWORD`)
+
+### Options
+
+| Key | Env var | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `password` | `PASSWORD` | yes | | The shared password |
+| `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`) |
+| `secret` | `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
+| `listen` | `LISTEN` | no | `:8080` | Listen address |
+| `title` | `TITLE` | no | `Password Required` | Login page heading |
+| `template` | `TEMPLATE` | no | built-in | Path to a custom HTML login page template |
+| `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
+| `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
+| `log_format` | `LOG_FORMAT` | no | `compact` | Log output format: `compact` or `json` |
+| — | `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
+
+### Config File Example
+
+```toml
+# hodor.toml
+password = "changeme"
+upstream = "http://app:3000"
+secret = "replace-with-openssl-rand-hex-32"
+title = "Restricted Area"
+session_ttl = 3600
+secure_cookie = true
+```
+
+Environment variables always win. Set `PASSWORD=override` and it takes precedence over `password` in the TOML file.
 
 ## How It Works
 
@@ -92,7 +110,7 @@ All other paths are proxied to the upstream.
 
 ## Custom Login Page
 
-Hodor ships with a built-in dark-themed login page. To use your own, set `TEMPLATE` to the path of an HTML file:
+Hodor ships with a built-in dark-themed login page. To use your own, set `template` to the path of an HTML file:
 
 ```yaml
 environment:
@@ -101,36 +119,40 @@ volumes:
   - ./my-login.html:/etc/hodor/login.html:ro
 ```
 
+Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinja](https://github.com/mitsuhiko/minijinja)). The following variables are available:
+
+| Variable | Type | Description |
+| --- | --- | --- |
+| `title` | string | The configured title (auto-escaped) |
+| `show_error` | bool | `true` when the user entered a wrong password |
+
+### Template Example
+
+```html
+<!DOCTYPE html>
+<html>
+<head><title>{{ title }}</title></head>
+<body>
+  <h1>{{ title }}</h1>
+  {% if show_error %}<p style="color:red">Wrong password.</p>{% endif %}
+  <form method="post" action="/_gate/login">
+    <input type="hidden" name="redirect" value="/">
+    <input name="password" type="password" required>
+    <button type="submit">Continue</button>
+  </form>
+  <script>
+    document.querySelector('input[name="redirect"]').value =
+      window.location.pathname + window.location.search;
+  </script>
+</body>
+</html>
+```
+
 ### Template Requirements
 
-Your custom HTML must include:
-
-1. A form that POSTs to `/_gate/login` with a `password` field and a `redirect` hidden field:
-
-   ```html
-   <form method="post" action="/_gate/login">
-     <input type="hidden" name="redirect" value="/">
-     <input name="password" type="password" required>
-     <button type="submit">Continue</button>
-   </form>
-   ```
-
-2. An error element with `display:none;` in its inline style (hodor flips this to `display:block;` on wrong password):
-
-   ```html
-   <div style="display:none;">Wrong password.</div>
-   ```
-
-3. (Optional) Use `__TITLE__` anywhere in the HTML — it gets replaced with the `TITLE` env var value at startup.
-
-4. (Optional) JavaScript to capture the current URL into the redirect field:
-
-   ```html
-   <script>
-     document.querySelector('input[name="redirect"]').value =
-       window.location.pathname + window.location.search;
-   </script>
-   ```
+1. The form **must** POST to `/_gate/login` with a `password` field
+2. Include a `redirect` hidden field (populated via JS) so users return to the page they were trying to access
+3. Use `{% if show_error %}` to conditionally show error messages
 
 ## Building from Source
 
