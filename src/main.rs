@@ -7,13 +7,17 @@ use axum::http::header::{
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
+use figment::Figment;
+use figment::providers::{Env, Format, Serialized, Toml};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use minijinja::{Environment, context};
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -27,107 +31,18 @@ use tracing_subscriber::EnvFilter;
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "hodor";
-const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+const BUILTIN_TEMPLATE: &str = include_str!("template.html");
 const RATE_LIMIT_ATTEMPTS: usize = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const TEMPLATE_NAME: &str = "login.html";
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
-const DEFAULT_TEMPLATE: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>__TITLE__</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: #0f0f0f;
-      color: #f5f5f5;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .card {
-      width: 100%;
-      max-width: 400px;
-      background: #1a1a1a;
-      border: 1px solid #2a2a2a;
-      border-radius: 16px;
-      padding: 28px;
-      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
-    }
-    h1 {
-      margin: 0 0 20px;
-      font-size: 1.5rem;
-      font-weight: 700;
-    }
-    label {
-      display: block;
-      margin-bottom: 8px;
-      font-size: 0.95rem;
-      color: #d4d4d4;
-    }
-    input[type="password"] {
-      width: 100%;
-      padding: 12px 14px;
-      border: 1px solid #2a2a2a;
-      border-radius: 12px;
-      background: #111111;
-      color: #f5f5f5;
-      font: inherit;
-      margin-bottom: 16px;
-    }
-    button {
-      width: 100%;
-      padding: 12px 14px;
-      border: 1px solid #2a2a2a;
-      border-radius: 12px;
-      background: #ffffff;
-      color: #000000;
-      font: inherit;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .error {
-      display:none;
-      margin-bottom: 16px;
-      padding: 12px 14px;
-      border-radius: 12px;
-      border: 1px solid rgba(248, 113, 113, 0.25);
-      background: rgba(127, 29, 29, 0.35);
-      color: #f87171;
-    }
-  </style>
-</head>
-<body>
-  <main class="card">
-    <h1>__TITLE__</h1>
-    <div class="error">Wrong password.</div>
-    <form method="post" action="/_gate/login">
-      <input type="hidden" name="redirect" value="/">
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
-      <button type="submit">Continue</button>
-    </form>
-  </main>
-  <script>
-    const redirect = document.querySelector('input[name="redirect"]');
-    if (redirect) {
-      redirect.value = `${window.location.pathname}${window.location.search}${window.location.hash}` || '/';
-    }
-  </script>
-</body>
-</html>
-"#;
 
 #[derive(Clone)]
 struct AppState {
     password: Vec<u8>,
-    template: String,
+    title: String,
+    template_source: String,
     secret: Vec<u8>,
     upstream: Uri,
     upstream_scheme: String,
@@ -139,47 +54,88 @@ struct AppState {
     client: Client<HttpConnector, Body>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Config {
+    password: String,
+    upstream: String,
+    #[serde(default = "default_listen")]
+    listen: String,
+    #[serde(default = "default_title")]
+    title: String,
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default = "default_session_ttl")]
+    session_ttl: u64,
+    #[serde(default)]
+    secure_cookie: bool,
+    #[serde(default = "default_log_format")]
+    log_format: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            password: String::new(),
+            upstream: String::new(),
+            listen: default_listen(),
+            title: default_title(),
+            template: None,
+            secret: None,
+            session_ttl: default_session_ttl(),
+            secure_cookie: false,
+            log_format: default_log_format(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    init_tracing();
+    init_tracing(&std::env::var("LOG_FORMAT").unwrap_or_else(|_| default_log_format()));
 
-    let password = std::env::var("PASSWORD").unwrap().into_bytes();
-    let upstream_raw = std::env::var("UPSTREAM").unwrap();
-    let listen = std::env::var("LISTEN").unwrap_or_else(|_| ":8080".to_string());
-    let title = std::env::var("TITLE").unwrap_or_else(|_| "Password Required".to_string());
-    let template_path = std::env::var("TEMPLATE").ok();
-    let template = load_template(&title, template_path.as_deref());
-    let session_ttl = Duration::from_secs(parse_session_ttl());
-    let secure_cookie = parse_secure_cookie();
-
-    let upstream: Uri = upstream_raw.parse().unwrap();
-    let upstream_scheme = upstream.scheme_str().unwrap().to_string();
-    let upstream_authority = upstream.authority().unwrap().to_string();
+    let config = load_config();
+    let upstream: Uri = config
+        .upstream
+        .parse()
+        .expect("UPSTREAM must be a valid URI");
+    let upstream_scheme = upstream
+        .scheme_str()
+        .expect("UPSTREAM must include a scheme")
+        .to_string();
+    let upstream_authority = upstream
+        .authority()
+        .expect("UPSTREAM must include an authority")
+        .to_string();
     let upstream_base_path = upstream.path().trim_end_matches('/').to_string();
-    let secret = load_secret();
-    let listen_addr = parse_listen_addr(&listen);
+    let listen_addr = parse_listen_addr(&config.listen);
+    let template_source = load_template(config.template.as_deref());
+    validate_template(&template_source, &config.title).expect("template must parse and render");
+    let secret = load_secret(config.secret.as_deref());
 
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
-        password,
-        template,
+        password: config.password.into_bytes(),
+        title: config.title,
+        template_source,
         secret,
         upstream,
         upstream_scheme,
         upstream_authority,
         upstream_base_path,
-        session_ttl,
-        secure_cookie,
+        session_ttl: Duration::from_secs(config.session_ttl),
+        secure_cookie: config.secure_cookie,
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         client,
     };
 
     info!(
         listen_addr = %listen_addr,
-        upstream = %upstream_raw,
-        custom_template_loaded = template_path.is_some(),
+        upstream = %state.upstream,
+        custom_template_loaded = config.template.is_some(),
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
+        log_format = %config.log_format,
         "starting hodor"
     );
 
@@ -190,14 +146,16 @@ async fn main() {
         .fallback(proxy_or_login)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(listen_addr)
+        .await
+        .expect("failed to bind listen address");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .unwrap();
+    .expect("server error");
 }
 
 async fn login_get() -> impl IntoResponse {
@@ -242,7 +200,7 @@ async fn login_post(
 
     if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
         info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
-        return login_page_response(&state.template, true);
+        return login_page_response(&state.template_source, &state.title, true);
     }
 
     let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
@@ -265,7 +223,7 @@ async fn proxy_or_login(
     request: Request<Body>,
 ) -> Response<Body> {
     if !is_authenticated(request.headers(), &state.secret) {
-        return login_page_response(&state.template, false);
+        return login_page_response(&state.template_source, &state.title, false);
     }
 
     proxy_request(state, addr, request).await
@@ -350,13 +308,46 @@ async fn proxy_request(
     }
 }
 
-fn login_page_response(template: &str, show_error: bool) -> Response<Body> {
-    let page = if show_error {
-        template.replacen("display:none;", "display:block;", 1)
-    } else {
-        template.to_string()
-    };
-    (StatusCode::UNAUTHORIZED, Html(page)).into_response()
+fn load_config() -> Config {
+    Figment::new()
+        .merge(Serialized::defaults(Config::default()))
+        .merge(Toml::file("hodor.toml"))
+        .merge(Env::raw())
+        .extract()
+        .expect("failed to load configuration from defaults, hodor.toml, and environment")
+}
+
+fn load_template(template_path: Option<&str>) -> String {
+    match template_path {
+        Some(path) => std::fs::read_to_string(path)
+            .expect("failed to read custom template from TEMPLATE path"),
+        None => BUILTIN_TEMPLATE.to_string(),
+    }
+}
+
+fn validate_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
+    render_login_page(template_source, title, false).map(|_| ())
+}
+
+fn render_login_page(
+    template_source: &str,
+    title: &str,
+    show_error: bool,
+) -> Result<String, minijinja::Error> {
+    let mut env = Environment::new();
+    env.add_template(TEMPLATE_NAME, template_source)?;
+    env.get_template(TEMPLATE_NAME)?
+        .render(context!(title => title, show_error => show_error))
+}
+
+fn login_page_response(template_source: &str, title: &str, show_error: bool) -> Response<Body> {
+    match render_login_page(template_source, title, show_error) {
+        Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
+        Err(error) => {
+            warn!(%error, "failed to render login page");
+            internal_server_error()
+        }
+    }
 }
 
 fn is_authenticated(headers: &HeaderMap, secret: &[u8]) -> bool {
@@ -474,10 +465,10 @@ fn validate_token(secret: &[u8], token: &str) -> bool {
     mac.verify_slice(&signature).is_ok()
 }
 
-fn load_secret() -> Vec<u8> {
-    match std::env::var("SECRET") {
-        Ok(secret) => secret.into_bytes(),
-        Err(_) => {
+fn load_secret(configured_secret: Option<&str>) -> Vec<u8> {
+    match configured_secret {
+        Some(secret) => secret.as_bytes().to_vec(),
+        None => {
             let mut secret = [0_u8; 32];
             rand::thread_rng().fill_bytes(&mut secret);
             warn!("SECRET not set, generated ephemeral signing key");
@@ -486,34 +477,15 @@ fn load_secret() -> Vec<u8> {
     }
 }
 
-fn load_template(title: &str, template_path: Option<&str>) -> String {
-    let raw = match template_path {
-        Some(path) => std::fs::read_to_string(path).unwrap(),
-        None => DEFAULT_TEMPLATE.to_string(),
-    };
-
-    raw.replace("__TITLE__", &escape_html(title))
-}
-
-fn parse_session_ttl() -> u64 {
-    std::env::var("SESSION_TTL")
-        .map(|value| value.parse::<u64>().unwrap())
-        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
-}
-
-fn parse_secure_cookie() -> bool {
-    std::env::var("SECURE_COOKIE")
-        .map(|value| value.parse::<bool>().unwrap())
-        .unwrap_or(false)
-}
-
 fn parse_listen_addr(listen: &str) -> SocketAddr {
     let listen = if let Some(port) = listen.strip_prefix(':') {
         format!("0.0.0.0:{port}")
     } else {
         listen.to_string()
     };
-    listen.parse().unwrap()
+    listen
+        .parse()
+        .expect("LISTEN must be a valid socket address")
 }
 
 fn build_upstream_uri(state: &AppState, path: &str, query: Option<&str>) -> Uri {
@@ -599,15 +571,6 @@ fn sanitize_redirect(redirect: &str) -> String {
     }
 }
 
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -655,9 +618,8 @@ async fn collect_body(body: Body) -> Result<Bytes, Response<Body>> {
     }
 }
 
-fn init_tracing() {
+fn init_tracing(format: &str) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "compact".to_string());
 
     if format.eq_ignore_ascii_case("json") {
         tracing_subscriber::fmt()
@@ -674,11 +636,16 @@ fn init_tracing() {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.unwrap();
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl-c");
     };
 
     let terminate = async {
-        signal(SignalKind::terminate()).unwrap().recv().await;
+        signal(SignalKind::terminate())
+            .expect("failed to listen for SIGTERM")
+            .recv()
+            .await;
     };
 
     tokio::select! {
@@ -687,6 +654,22 @@ async fn shutdown_signal() {
     }
 
     info!("shutdown signal received");
+}
+
+fn default_listen() -> String {
+    ":8080".to_string()
+}
+
+fn default_title() -> String {
+    "Password Required".to_string()
+}
+
+fn default_session_ttl() -> u64 {
+    86_400
+}
+
+fn default_log_format() -> String {
+    "compact".to_string()
 }
 
 fn internal_server_error() -> Response<Body> {
@@ -698,7 +681,6 @@ fn bad_gateway() -> Response<Body> {
 }
 
 fn websocket_not_supported() -> Response<Body> {
-    // TODO: Implement bidirectional upgraded IO proxying for WebSocket support without regressing HTTP streaming behavior.
     (
         StatusCode::NOT_IMPLEMENTED,
         "websocket proxying is not supported yet",
