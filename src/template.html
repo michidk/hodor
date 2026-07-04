@@ -67,6 +67,24 @@
       background: rgba(127, 29, 29, 0.35);
       color: #f87171;
     }
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 16px 0;
+      color: #6b6b6b;
+      font-size: 0.85rem;
+    }
+    .divider::before,
+    .divider::after {
+      content: "";
+      flex: 1;
+      border-top: 1px solid #2a2a2a;
+    }
+    button.secondary {
+      background: #111111;
+      color: #f5f5f5;
+    }
   </style>
 </head>
 <body>
@@ -79,6 +97,10 @@
       <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
       <button type="submit">Continue</button>
     </form>
+    {% if passkeys_enabled %}
+    <div class="divider">or</div>
+    <button type="button" id="passkey-button" class="secondary">Sign in with a passkey</button>
+    {% endif %}
   </main>
   <script>
     const redirect = document.querySelector('input[name="redirect"]');
@@ -86,5 +108,68 @@
       redirect.value = `${window.location.pathname}${window.location.search}${window.location.hash}` || '/';
     }
   </script>
+  {% if passkeys_enabled %}
+  <script>
+    (() => {
+      const button = document.getElementById('passkey-button');
+      if (!window.PublicKeyCredential) {
+        button.style.display = 'none';
+        return;
+      }
+
+      const error = document.querySelector('.error');
+      const fail = (message) => {
+        error.textContent = message;
+        error.style.display = 'block';
+      };
+
+      const b64uToBuf = (value) =>
+        Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)).buffer;
+      const bufToB64u = (buffer) =>
+        btoa(String.fromCharCode(...new Uint8Array(buffer)))
+          .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+      button.addEventListener('click', async () => {
+        try {
+          const startResponse = await fetch('/_gate/passkey/login/start', { method: 'POST' });
+          if (!startResponse.ok) return fail(await startResponse.text());
+          const { id, challenge } = await startResponse.json();
+          const publicKey = challenge.publicKey;
+          publicKey.challenge = b64uToBuf(publicKey.challenge);
+          if (publicKey.allowCredentials) {
+            publicKey.allowCredentials = publicKey.allowCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) }));
+          }
+          const credential = await navigator.credentials.get({ publicKey });
+          const finishResponse = await fetch('/_gate/passkey/login/finish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id,
+              redirect: redirect ? redirect.value : '/',
+              credential: {
+                id: credential.id,
+                rawId: bufToB64u(credential.rawId),
+                type: credential.type,
+                extensions: credential.getClientExtensionResults(),
+                response: {
+                  authenticatorData: bufToB64u(credential.response.authenticatorData),
+                  clientDataJSON: bufToB64u(credential.response.clientDataJSON),
+                  signature: bufToB64u(credential.response.signature),
+                  userHandle: credential.response.userHandle ? bufToB64u(credential.response.userHandle) : null,
+                },
+              },
+            }),
+          });
+          if (!finishResponse.ok) return fail(await finishResponse.text());
+          window.location.href = (await finishResponse.json()).redirect;
+        } catch (err) {
+          if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
+            fail('Passkey sign-in failed.');
+          }
+        }
+      });
+    })();
+  </script>
+  {% endif %}
 </body>
 </html>

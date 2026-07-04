@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-Hodor is a tiny Rust reverse proxy that gates any web app behind a single shared password. It runs as a Docker sidecar — no users, no database, no OAuth. One binary, one password, one login page.
+Hodor is a tiny Rust reverse proxy that gates any web app behind a single shared password, with optional passkey (WebAuthn) login. It runs as a Docker sidecar — no users, no database, no OAuth. One binary, one password, one login page.
 
 ## Architecture
 
-Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.rs`, with the default templates in `src/template.html` (login page) and `src/error_template.html` (error page).
+Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.rs`, with the default templates in `src/template.html` (login page), `src/error_template.html` (error page), and `src/passkeys_template.html` (passkey management page).
 
 ### Request Flow
 
@@ -14,7 +14,11 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 2. `/_gate/health` → bypass auth, return 200
 3. `/_gate/login` (POST) → rate-limit check → constant-time password compare → set session cookie
 4. `/_gate/logout` → clear cookie, redirect
-5. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, render login page via minijinja
+5. `/_gate/passkeys` (GET) → passkey management page (requires session; only when passkeys enabled)
+6. `/_gate/passkey/register/{start,finish}` (POST) → WebAuthn registration ceremony (requires session)
+7. `/_gate/passkey/login/{start,finish}` (POST) → WebAuthn login ceremony (start is rate-limited) → set session cookie
+8. `/_gate/passkey/delete` (POST) → remove a stored passkey (requires session)
+9. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, render login page via minijinja
 
 ### Key Components
 
@@ -22,18 +26,21 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 - **AppState**: shared runtime state (config-derived values, rate limiter, HTTP client)
 - **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET
 - **Rate limiter**: in-memory `HashMap<IpAddr, Vec<Instant>>` behind `Arc<Mutex<_>>`, 5 attempts per 60s per IP
-- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config. Login variables: `title`, `show_error`. Error variables: `title`, `status_code`, `heading`, `message`.
+- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html`, error template in `src/error_template.html`, and passkey management template in `src/passkeys_template.html` (all embedded via `include_str!`). Custom login/error templates via `TEMPLATE`/`ERROR_TEMPLATE` config. Login variables: `title`, `show_error`, `passkeys_enabled`. Error variables: `title`, `status_code`, `heading`, `message`. Passkeys page variables: `title`, `passkeys` (list of `{id, name, added_at}`).
+- **Passkeys**: webauthn-rs. Enabled when `ORIGIN` is set (`RP_ID` optionally overrides the relying party ID derived from it). Registered credentials persist as JSON in `PASSKEYS_FILE` (default `passkeys.json`), written atomically via temp file + rename. All passkeys belong to one fixed user handle (shared identity). In-flight WebAuthn ceremony state lives in in-memory challenge maps with a 5-minute TTL and a 256-entry cap.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 
 ### Dependencies
 
 - **HTTP**: tokio, axum, hyper, hyper-util, http, http-body-util
 - **Crypto**: hmac, sha2, subtle, hex, rand
+- **Passkeys**: webauthn-rs (pulls in openssl — the Dockerfile links it statically)
 - **Config**: figment, serde
 - **Templates**: minijinja
+- **Serialization**: serde_json
 - **Logging**: tracing, tracing-subscriber
 
-No database, no ORM, no framework magic.
+No database, no ORM, no framework magic. (Passkeys persist to a single JSON file.)
 
 ## Configuration
 

@@ -1,6 +1,7 @@
 FROM rust:1-alpine AS build
 # hadolint ignore=DL3018
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
+ENV OPENSSL_STATIC=1
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -rf src

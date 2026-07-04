@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: #0f0f0f;
+      color: #f5f5f5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 20px;
+      font-size: 1.5rem;
+      font-weight: 700;
+    }
+    ul {
+      list-style: none;
+      margin: 0 0 20px;
+      padding: 0;
+    }
+    li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      margin-bottom: 8px;
+    }
+    .name { font-weight: 600; overflow-wrap: anywhere; }
+    .added { color: #a3a3a3; font-size: 0.85rem; }
+    .empty { margin: 0 0 20px; color: #a3a3a3; }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.95rem;
+      color: #d4d4d4;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      background: #111111;
+      color: #f5f5f5;
+      font: inherit;
+      margin-bottom: 16px;
+    }
+    button {
+      padding: 12px 14px;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary {
+      width: 100%;
+      background: #ffffff;
+      color: #000000;
+    }
+    button.remove {
+      background: #111111;
+      color: #f87171;
+      padding: 8px 12px;
+      flex-shrink: 0;
+    }
+    .error {
+      display: none;
+      margin-bottom: 16px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(248, 113, 113, 0.25);
+      background: rgba(127, 29, 29, 0.35);
+      color: #f87171;
+    }
+    .links {
+      margin: 20px 0 0;
+      color: #a3a3a3;
+      font-size: 0.9rem;
+    }
+    .links a { color: #d4d4d4; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Passkeys</h1>
+    <div class="error"></div>
+    {% if passkeys %}
+    <ul>
+      {% for passkey in passkeys %}
+      <li>
+        <div>
+          <div class="name">{{ passkey.name }}</div>
+          <div class="added" data-added-at="{{ passkey.added_at }}"></div>
+        </div>
+        <button type="button" class="remove" data-id="{{ passkey.id }}">Remove</button>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No passkeys registered yet.</p>
+    {% endif %}
+    <form id="register">
+      <label for="name">New passkey name</label>
+      <input id="name" name="name" type="text" placeholder="e.g. laptop" maxlength="64">
+      <button type="submit" class="primary">Register a passkey</button>
+    </form>
+    <p class="links"><a href="/">Back</a> · <a href="/_gate/logout">Log out</a></p>
+  </main>
+  <script>
+    for (const element of document.querySelectorAll('[data-added-at]')) {
+      const added = new Date(Number(element.dataset.addedAt) * 1000);
+      element.textContent = `added ${added.toLocaleDateString()}`;
+    }
+
+    const error = document.querySelector('.error');
+    const fail = (message) => {
+      error.textContent = message;
+      error.style.display = 'block';
+    };
+
+    const b64uToBuf = (value) =>
+      Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)).buffer;
+    const bufToB64u = (buffer) =>
+      btoa(String.fromCharCode(...new Uint8Array(buffer)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    document.getElementById('register').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (!window.PublicKeyCredential) return fail('This browser does not support passkeys.');
+      try {
+        const startResponse = await fetch('/_gate/passkey/register/start', { method: 'POST' });
+        if (!startResponse.ok) return fail(await startResponse.text());
+        const { id, challenge } = await startResponse.json();
+        const publicKey = challenge.publicKey;
+        publicKey.challenge = b64uToBuf(publicKey.challenge);
+        publicKey.user.id = b64uToBuf(publicKey.user.id);
+        if (publicKey.excludeCredentials) {
+          publicKey.excludeCredentials = publicKey.excludeCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) }));
+        }
+        const credential = await navigator.credentials.create({ publicKey });
+        const finishResponse = await fetch('/_gate/passkey/register/finish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id,
+            name: document.getElementById('name').value,
+            credential: {
+              id: credential.id,
+              rawId: bufToB64u(credential.rawId),
+              type: credential.type,
+              extensions: credential.getClientExtensionResults(),
+              response: {
+                attestationObject: bufToB64u(credential.response.attestationObject),
+                clientDataJSON: bufToB64u(credential.response.clientDataJSON),
+                transports: credential.response.getTransports ? credential.response.getTransports() : [],
+              },
+            },
+          }),
+        });
+        if (!finishResponse.ok) return fail(await finishResponse.text());
+        window.location.reload();
+      } catch (err) {
+        if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
+          fail('Passkey registration failed.');
+        }
+      }
+    });
+
+    for (const button of document.querySelectorAll('button.remove')) {
+      button.addEventListener('click', async () => {
+        const response = await fetch('/_gate/passkey/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: button.dataset.id }),
+        });
+        if (!response.ok) return fail(await response.text());
+        window.location.reload();
+      });
+    }
+  </script>
+</body>
+</html>

@@ -1,4 +1,3 @@
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{
@@ -6,7 +5,8 @@ use axum::http::header::{
 };
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Redirect};
-use axum::routing::get;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use hmac::{Hmac, Mac};
@@ -27,16 +27,27 @@ use subtle::ConstantTimeEq;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use webauthn_rs::prelude::{
+    CredentialID, Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, Url, Uuid, Webauthn, WebauthnBuilder,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "hodor";
 const BUILTIN_TEMPLATE: &str = include_str!("template.html");
 const BUILTIN_ERROR_TEMPLATE: &str = include_str!("error_template.html");
+const BUILTIN_PASSKEYS_TEMPLATE: &str = include_str!("passkeys_template.html");
 const RATE_LIMIT_ATTEMPTS: usize = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const ERROR_TEMPLATE_NAME: &str = "error.html";
 const TEMPLATE_NAME: &str = "login.html";
+const PASSKEYS_TEMPLATE_NAME: &str = "passkeys.html";
+const CHALLENGE_TTL: Duration = Duration::from_secs(300);
+const MAX_PENDING_CHALLENGES: usize = 256;
+const PASSKEY_NAME_MAX_CHARS: usize = 64;
+// Hodor has a single shared identity, so every passkey is registered under one fixed user handle.
+const PASSKEY_USER_ID: Uuid = Uuid::from_bytes(*b"hodor-shared-usr");
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 
@@ -55,6 +66,56 @@ struct AppState {
     secure_cookie: bool,
     rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
     client: Client<HttpConnector, Body>,
+    webauthn: Option<Arc<Webauthn>>,
+    passkeys: Arc<Mutex<Vec<PasskeyRecord>>>,
+    passkeys_file: String,
+    reg_challenges: Arc<Mutex<HashMap<String, (Instant, PasskeyRegistration)>>>,
+    auth_challenges: Arc<Mutex<HashMap<String, (Instant, PasskeyAuthentication)>>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PasskeyRecord {
+    name: String,
+    added_at: u64,
+    passkey: Passkey,
+}
+
+#[derive(Serialize)]
+struct PasskeyView {
+    id: String,
+    name: String,
+    added_at: u64,
+}
+
+impl PasskeyView {
+    fn from_record(record: &PasskeyRecord) -> Self {
+        Self {
+            id: hex::encode(record.passkey.cred_id().as_ref()),
+            name: record.name.clone(),
+            added_at: record.added_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PasskeyRegisterFinishRequest {
+    id: String,
+    #[serde(default)]
+    name: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Deserialize)]
+struct PasskeyLoginFinishRequest {
+    id: String,
+    #[serde(default)]
+    redirect: Option<String>,
+    credential: PublicKeyCredential,
+}
+
+#[derive(Deserialize)]
+struct PasskeyDeleteRequest {
+    id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -77,6 +138,12 @@ struct Config {
     secure_cookie: bool,
     #[serde(default = "default_log_format")]
     log_format: String,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    rp_id: Option<String>,
+    #[serde(default = "default_passkeys_file")]
+    passkeys_file: String,
 }
 
 impl Default for Config {
@@ -92,6 +159,9 @@ impl Default for Config {
             session_ttl: default_session_ttl(),
             secure_cookie: false,
             log_format: default_log_format(),
+            origin: None,
+            rp_id: None,
+            passkeys_file: default_passkeys_file(),
         }
     }
 }
@@ -121,6 +191,15 @@ async fn main() {
     validate_error_template(&error_template_source, &config.title)
         .expect("error template must parse and render");
     let secret = load_secret(config.secret.as_deref());
+    let webauthn = build_webauthn(config.origin.as_deref(), config.rp_id.as_deref());
+    let passkeys = if webauthn.is_some() {
+        validate_passkeys_template(BUILTIN_PASSKEYS_TEMPLATE, &config.title)
+            .expect("passkeys template must parse and render");
+        load_passkeys(&config.passkeys_file).expect("failed to load passkeys file")
+    } else {
+        Vec::new()
+    };
+    let passkey_count = passkeys.len();
 
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
@@ -137,6 +216,11 @@ async fn main() {
         secure_cookie: config.secure_cookie,
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         client,
+        webauthn,
+        passkeys: Arc::new(Mutex::new(passkeys)),
+        passkeys_file: config.passkeys_file,
+        reg_challenges: Arc::new(Mutex::new(HashMap::new())),
+        auth_challenges: Arc::new(Mutex::new(HashMap::new())),
     };
 
     info!(
@@ -146,6 +230,8 @@ async fn main() {
         custom_error_template_loaded = config.error_template.is_some(),
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
+        passkeys_enabled = state.webauthn.is_some(),
+        passkeys_registered = passkey_count,
         log_format = %config.log_format,
         "starting hodor"
     );
@@ -154,6 +240,18 @@ async fn main() {
         .route("/_gate/login", get(login_get).post(login_post))
         .route("/_gate/logout", get(logout))
         .route("/_gate/health", get(health))
+        .route("/_gate/passkeys", get(passkeys_page))
+        .route(
+            "/_gate/passkey/register/start",
+            post(passkey_register_start),
+        )
+        .route(
+            "/_gate/passkey/register/finish",
+            post(passkey_register_finish),
+        )
+        .route("/_gate/passkey/login/start", post(passkey_login_start))
+        .route("/_gate/passkey/login/finish", post(passkey_login_finish))
+        .route("/_gate/passkey/delete", post(passkey_delete))
         .fallback(proxy_or_login)
         .with_state(state);
 
@@ -211,7 +309,7 @@ async fn login_post(
 
     if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
         info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
-        return login_page_response(&state.template_source, &state.title, true);
+        return login_page_response(&state, true);
     }
 
     let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
@@ -228,13 +326,270 @@ async fn login_post(
     }
 }
 
+async fn passkeys_page(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    if state.webauthn.is_none() {
+        return error_page_response(
+            &state,
+            StatusCode::NOT_FOUND,
+            "Passkeys Not Enabled",
+            "Set ORIGIN to the public URL of this instance to enable passkeys.",
+        );
+    }
+
+    if !is_authenticated(&headers, &state.secret) {
+        return login_page_response(&state, false);
+    }
+
+    let passkeys: Vec<PasskeyView> = {
+        let records = state.passkeys.lock().expect("passkey store lock poisoned");
+        records.iter().map(PasskeyView::from_record).collect()
+    };
+
+    match render_passkeys_page(BUILTIN_PASSKEYS_TEMPLATE, &state.title, &passkeys) {
+        Ok(page) => Html(page).into_response(),
+        Err(error) => {
+            warn!(%error, "failed to render passkeys page");
+            internal_server_error(&state)
+        }
+    }
+}
+
+async fn passkey_register_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(webauthn) = state.webauthn.as_ref() else {
+        return (StatusCode::NOT_FOUND, "passkeys not enabled").into_response();
+    };
+    if !is_authenticated(&headers, &state.secret) {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    }
+
+    let exclude: Vec<CredentialID> = {
+        let records = state.passkeys.lock().expect("passkey store lock poisoned");
+        records
+            .iter()
+            .map(|record| record.passkey.cred_id().clone())
+            .collect()
+    };
+    let exclude = (!exclude.is_empty()).then_some(exclude);
+
+    let (challenge, registration) =
+        match webauthn.start_passkey_registration(PASSKEY_USER_ID, "hodor", "hodor", exclude) {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(%error, "failed to start passkey registration");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to start passkey registration",
+                )
+                    .into_response();
+            }
+        };
+
+    let Some(id) = challenge_insert(&state.reg_challenges, registration) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many pending passkey challenges",
+        )
+            .into_response();
+    };
+
+    Json(serde_json::json!({ "id": id, "challenge": challenge })).into_response()
+}
+
+async fn passkey_register_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PasskeyRegisterFinishRequest>,
+) -> Response<Body> {
+    let Some(webauthn) = state.webauthn.as_ref() else {
+        return (StatusCode::NOT_FOUND, "passkeys not enabled").into_response();
+    };
+    if !is_authenticated(&headers, &state.secret) {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    }
+
+    let Some(registration) = challenge_take(&state.reg_challenges, &request.id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "unknown or expired passkey challenge",
+        )
+            .into_response();
+    };
+
+    let passkey = match webauthn.finish_passkey_registration(&request.credential, &registration) {
+        Ok(passkey) => passkey,
+        Err(error) => {
+            warn!(%error, "passkey registration failed");
+            return (StatusCode::BAD_REQUEST, "passkey registration failed").into_response();
+        }
+    };
+
+    let mut records = state.passkeys.lock().expect("passkey store lock poisoned");
+    records.push(PasskeyRecord {
+        name: sanitize_passkey_name(&request.name),
+        added_at: now_unix(),
+        passkey,
+    });
+    if let Err(error) = save_passkeys(&state.passkeys_file, &records) {
+        records.pop();
+        warn!(%error, "failed to persist passkeys");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist passkey",
+        )
+            .into_response();
+    }
+
+    info!(passkeys = records.len(), "passkey registered");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn passkey_login_start(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response<Body> {
+    let Some(webauthn) = state.webauthn.as_ref() else {
+        return (StatusCode::NOT_FOUND, "passkeys not enabled").into_response();
+    };
+
+    let client_ip = addr.ip();
+    if !allow_login_attempt(&state, client_ip) {
+        info!(client_ip = %client_ip, success = false, rate_limited = true, method = "passkey", "login attempt");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many login attempts").into_response();
+    }
+
+    let credentials: Vec<Passkey> = {
+        let records = state.passkeys.lock().expect("passkey store lock poisoned");
+        records
+            .iter()
+            .map(|record| record.passkey.clone())
+            .collect()
+    };
+    if credentials.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no passkeys registered").into_response();
+    }
+
+    let (challenge, authentication) = match webauthn.start_passkey_authentication(&credentials) {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(%error, "failed to start passkey authentication");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to start passkey authentication",
+            )
+                .into_response();
+        }
+    };
+
+    let Some(id) = challenge_insert(&state.auth_challenges, authentication) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many pending passkey challenges",
+        )
+            .into_response();
+    };
+
+    Json(serde_json::json!({ "id": id, "challenge": challenge })).into_response()
+}
+
+async fn passkey_login_finish(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<PasskeyLoginFinishRequest>,
+) -> Response<Body> {
+    let Some(webauthn) = state.webauthn.as_ref() else {
+        return (StatusCode::NOT_FOUND, "passkeys not enabled").into_response();
+    };
+
+    let client_ip = addr.ip();
+    let Some(authentication) = challenge_take(&state.auth_challenges, &request.id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "unknown or expired passkey challenge",
+        )
+            .into_response();
+    };
+
+    let result = match webauthn.finish_passkey_authentication(&request.credential, &authentication)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            info!(client_ip = %client_ip, success = false, rate_limited = false, method = "passkey", "login attempt");
+            debug!(%error, "passkey authentication failed");
+            return (StatusCode::UNAUTHORIZED, "passkey authentication failed").into_response();
+        }
+    };
+
+    {
+        let mut records = state.passkeys.lock().expect("passkey store lock poisoned");
+        let mut changed = false;
+        for record in records.iter_mut() {
+            if record.passkey.update_credential(&result) == Some(true) {
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(error) = save_passkeys(&state.passkeys_file, &records) {
+                warn!(%error, "failed to persist passkey counter update");
+            }
+        }
+    }
+
+    let redirect = sanitize_redirect(request.redirect.as_deref().unwrap_or("/"));
+    let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
+    let cookie = session_cookie(&state, &token);
+
+    let mut response = Json(serde_json::json!({ "redirect": redirect })).into_response();
+    match HeaderValue::from_str(&cookie) {
+        Ok(value) => {
+            info!(client_ip = %client_ip, success = true, rate_limited = false, method = "passkey", "login attempt");
+            response.headers_mut().insert(SET_COOKIE, value);
+            response
+        }
+        Err(_) => internal_server_error(&state),
+    }
+}
+
+async fn passkey_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PasskeyDeleteRequest>,
+) -> Response<Body> {
+    if state.webauthn.is_none() {
+        return (StatusCode::NOT_FOUND, "passkeys not enabled").into_response();
+    }
+    if !is_authenticated(&headers, &state.secret) {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    }
+
+    let mut records = state.passkeys.lock().expect("passkey store lock poisoned");
+    let before = records.len();
+    records.retain(|record| hex::encode(record.passkey.cred_id().as_ref()) != request.id);
+    if records.len() == before {
+        return (StatusCode::NOT_FOUND, "unknown passkey").into_response();
+    }
+    if let Err(error) = save_passkeys(&state.passkeys_file, &records) {
+        warn!(%error, "failed to persist passkeys");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist passkey removal",
+        )
+            .into_response();
+    }
+
+    info!(passkeys = records.len(), "passkey removed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn proxy_or_login(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
     if !is_authenticated(request.headers(), &state.secret) {
-        return login_page_response(&state.template_source, &state.title, false);
+        return login_page_response(&state, false);
     }
 
     proxy_request(state, addr, request).await
@@ -345,7 +700,11 @@ fn load_error_template(template_path: Option<&str>) -> String {
 }
 
 fn validate_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
-    render_login_page(template_source, title, false).map(|_| ())
+    render_login_page(template_source, title, false, true).map(|_| ())
+}
+
+fn validate_passkeys_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
+    render_passkeys_page(template_source, title, &[]).map(|_| ())
 }
 
 fn validate_error_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
@@ -363,11 +722,26 @@ fn render_login_page(
     template_source: &str,
     title: &str,
     show_error: bool,
+    passkeys_enabled: bool,
 ) -> Result<String, minijinja::Error> {
     let mut env = Environment::new();
     env.add_template(TEMPLATE_NAME, template_source)?;
-    env.get_template(TEMPLATE_NAME)?
-        .render(context!(title => title, show_error => show_error))
+    env.get_template(TEMPLATE_NAME)?.render(context!(
+        title => title,
+        show_error => show_error,
+        passkeys_enabled => passkeys_enabled,
+    ))
+}
+
+fn render_passkeys_page(
+    template_source: &str,
+    title: &str,
+    passkeys: &[PasskeyView],
+) -> Result<String, minijinja::Error> {
+    let mut env = Environment::new();
+    env.add_template(PASSKEYS_TEMPLATE_NAME, template_source)?;
+    env.get_template(PASSKEYS_TEMPLATE_NAME)?
+        .render(context!(title => title, passkeys => passkeys))
 }
 
 fn render_error_page(
@@ -387,8 +761,13 @@ fn render_error_page(
     ))
 }
 
-fn login_page_response(template_source: &str, title: &str, show_error: bool) -> Response<Body> {
-    match render_login_page(template_source, title, show_error) {
+fn login_page_response(state: &AppState, show_error: bool) -> Response<Body> {
+    match render_login_page(
+        &state.template_source,
+        &state.title,
+        show_error,
+        state.webauthn.is_some(),
+    ) {
         Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
         Err(error) => {
             warn!(%error, "failed to render login page");
@@ -531,6 +910,67 @@ fn validate_token(secret: &[u8], token: &str) -> bool {
     };
     mac.update(expiry.to_string().as_bytes());
     mac.verify_slice(&signature).is_ok()
+}
+
+fn build_webauthn(origin: Option<&str>, rp_id: Option<&str>) -> Option<Arc<Webauthn>> {
+    let origin = origin?;
+    let url = Url::parse(origin).expect("ORIGIN must be a valid URL");
+    let rp_id = match rp_id {
+        Some(rp_id) => rp_id.to_string(),
+        None => url
+            .host_str()
+            .expect("ORIGIN must include a host")
+            .to_string(),
+    };
+    let webauthn = WebauthnBuilder::new(&rp_id, &url)
+        .expect("RP_ID must be a registrable suffix of the ORIGIN domain")
+        .build()
+        .expect("failed to initialise WebAuthn");
+    Some(Arc::new(webauthn))
+}
+
+fn load_passkeys(path: &str) -> std::io::Result<Vec<PasskeyRecord>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+// Written via a temp file + rename so a crash mid-write cannot corrupt the store.
+fn save_passkeys(path: &str, records: &[PasskeyRecord]) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(records).map_err(std::io::Error::other)?;
+    let tmp_path = format!("{path}.tmp");
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)
+}
+
+fn sanitize_passkey_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "passkey".to_string();
+    }
+    name.chars().take(PASSKEY_NAME_MAX_CHARS).collect()
+}
+
+fn challenge_insert<T>(store: &Mutex<HashMap<String, (Instant, T)>>, value: T) -> Option<String> {
+    let mut store = store.lock().expect("challenge store lock poisoned");
+    store.retain(|_, (created_at, _)| created_at.elapsed() < CHALLENGE_TTL);
+    if store.len() >= MAX_PENDING_CHALLENGES {
+        return None;
+    }
+
+    let mut id = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut id);
+    let id = hex::encode(id);
+    store.insert(id.clone(), (Instant::now(), value));
+    Some(id)
+}
+
+fn challenge_take<T>(store: &Mutex<HashMap<String, (Instant, T)>>, id: &str) -> Option<T> {
+    let mut store = store.lock().expect("challenge store lock poisoned");
+    store.retain(|_, (created_at, _)| created_at.elapsed() < CHALLENGE_TTL);
+    store.remove(id).map(|(_, value)| value)
 }
 
 fn load_secret(configured_secret: Option<&str>) -> Vec<u8> {
@@ -740,6 +1180,10 @@ fn default_log_format() -> String {
     "compact".to_string()
 }
 
+fn default_passkeys_file() -> String {
+    "passkeys.json".to_string()
+}
+
 fn internal_server_error(state: &AppState) -> Response<Body> {
     error_page_response(
         state,
@@ -790,6 +1234,11 @@ mod tests {
             secure_cookie,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
+            webauthn: None,
+            passkeys: Arc::new(Mutex::new(Vec::new())),
+            passkeys_file: "passkeys.json".to_string(),
+            reg_challenges: Arc::new(Mutex::new(HashMap::new())),
+            auth_challenges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1177,14 +1626,121 @@ mod tests {
 
     #[test]
     fn render_login_page_includes_title() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", false, false).unwrap();
         assert!(html.contains("My Gate"));
     }
 
     #[test]
     fn render_login_page_escapes_title() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", false).unwrap();
+        let html =
+            render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", false, false).unwrap();
         assert!(!html.contains("<script>xss</script>"));
+    }
+
+    #[test]
+    fn render_login_page_shows_passkey_button_when_enabled() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, true).unwrap();
+        assert!(html.contains("passkey-button"));
+    }
+
+    #[test]
+    fn render_login_page_hides_passkey_button_when_disabled() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, false).unwrap();
+        assert!(!html.contains("passkey-button"));
+    }
+
+    #[test]
+    fn render_passkeys_page_lists_passkeys() {
+        let passkeys = vec![PasskeyView {
+            id: "abc123".to_string(),
+            name: "laptop".to_string(),
+            added_at: 1_700_000_000,
+        }];
+        let html = render_passkeys_page(BUILTIN_PASSKEYS_TEMPLATE, "Test", &passkeys).unwrap();
+        assert!(html.contains("laptop"));
+        assert!(html.contains("abc123"));
+        assert!(!html.contains("No passkeys registered yet."));
+    }
+
+    #[test]
+    fn render_passkeys_page_escapes_names() {
+        let passkeys = vec![PasskeyView {
+            id: "abc123".to_string(),
+            name: "<script>xss</script>".to_string(),
+            added_at: 0,
+        }];
+        let html = render_passkeys_page(BUILTIN_PASSKEYS_TEMPLATE, "Test", &passkeys).unwrap();
+        assert!(!html.contains("<script>xss</script>"));
+    }
+
+    #[test]
+    fn render_passkeys_page_empty_state() {
+        let html = render_passkeys_page(BUILTIN_PASSKEYS_TEMPLATE, "Test", &[]).unwrap();
+        assert!(html.contains("No passkeys registered yet."));
+    }
+
+    #[test]
+    fn validate_passkeys_template_accepts_builtin() {
+        assert!(validate_passkeys_template(BUILTIN_PASSKEYS_TEMPLATE, "Test").is_ok());
+    }
+
+    #[test]
+    fn sanitize_passkey_name_defaults_when_empty() {
+        assert_eq!(sanitize_passkey_name(""), "passkey");
+        assert_eq!(sanitize_passkey_name("   "), "passkey");
+    }
+
+    #[test]
+    fn sanitize_passkey_name_trims_and_caps_length() {
+        assert_eq!(sanitize_passkey_name("  laptop  "), "laptop");
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_passkey_name(&long).chars().count(), 64);
+    }
+
+    #[test]
+    fn challenge_store_roundtrip() {
+        let store = Mutex::new(HashMap::new());
+        let id = challenge_insert(&store, 42_u32).unwrap();
+        assert_eq!(challenge_take(&store, &id), Some(42));
+        assert_eq!(challenge_take(&store, &id), None);
+    }
+
+    #[test]
+    fn challenge_store_unknown_id() {
+        let store: Mutex<HashMap<String, (Instant, u32)>> = Mutex::new(HashMap::new());
+        assert_eq!(challenge_take(&store, "missing"), None);
+    }
+
+    #[test]
+    fn challenge_store_enforces_cap() {
+        let store = Mutex::new(HashMap::new());
+        for value in 0..MAX_PENDING_CHALLENGES {
+            assert!(challenge_insert(&store, value).is_some());
+        }
+        assert!(challenge_insert(&store, 0).is_none());
+    }
+
+    #[test]
+    fn load_passkeys_missing_file_is_empty() {
+        let records = load_passkeys("/nonexistent/passkeys.json").unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn load_passkeys_rejects_invalid_json() {
+        let path = std::env::temp_dir().join("hodor-test-invalid-passkeys.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_passkeys(path.to_str().unwrap()).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_and_load_passkeys_roundtrip() {
+        let path = std::env::temp_dir().join("hodor-test-passkeys.json");
+        let path = path.to_str().unwrap();
+        save_passkeys(path, &[]).unwrap();
+        assert!(load_passkeys(path).unwrap().is_empty());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

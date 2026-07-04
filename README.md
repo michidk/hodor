@@ -5,6 +5,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 ## Features
 
 - Single shared password — no user accounts, no database
+- Optional passkey (WebAuthn) login — register passkeys once, skip the password after that
 - Clean dark-themed login page (or bring your own with Jinja2 templates)
 - Runs as a Docker sidecar in front of any web app
 - HMAC-SHA256 signed session cookies
@@ -67,6 +68,9 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
 | `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
 | `log_format` | `LOG_FORMAT` | no | `compact` | Tracing output format: `compact` or `json` |
+| `origin` | `ORIGIN` | no | | Public URL of this instance (e.g. `https://app.example.com`). Setting it enables passkey login |
+| `rp_id` | `RP_ID` | no | host of `origin` | WebAuthn relying party ID. Only set to a parent domain of `origin` if you need passkeys shared across subdomains |
+| `passkeys_file` | `PASSKEYS_FILE` | no | `passkeys.json` | Where registered passkeys are stored. Mount a volume to persist them |
 | — | `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
 
 ### Config File Example
@@ -83,6 +87,35 @@ secure_cookie = true
 
 Environment variables always win. Set `PASSWORD=override` and it takes precedence over `password` in the TOML file.
 
+## Passkeys
+
+Hodor can optionally accept passkeys (WebAuthn) as an alternative to the shared password. The password stays the root credential — you log in with it once, then register passkeys for a faster sign-in afterwards.
+
+To enable passkeys, set `ORIGIN` to the public URL your users see in their browser:
+
+```yaml
+environment:
+  PASSWORD: "changeme"
+  UPSTREAM: "http://app:80"
+  SECRET: "..."
+  ORIGIN: "https://app.example.com"    # enables passkey login
+  SECURE_COOKIE: "true"
+volumes:
+  - ./data:/data
+```
+
+Then:
+
+1. Log in with the password
+2. Visit `/_gate/passkeys` and register a passkey
+3. On your next visit, use the **Sign in with a passkey** button on the login page
+
+Notes:
+
+- Browsers only allow WebAuthn in secure contexts, so passkeys require HTTPS (or `localhost` for testing). Run hodor behind a TLS-terminating proxy and set `ORIGIN` to the exact public URL — a mismatch makes the browser or hodor reject the ceremony.
+- Registered passkeys are stored in `passkeys_file` (default `passkeys.json` in the working directory). Mount a volume (and point `PASSKEYS_FILE` at it, e.g. `/data/passkeys.json`) so they survive container restarts. No volume means passkeys are lost on restart — password login always keeps working.
+- Anyone who knows the shared password can manage passkeys at `/_gate/passkeys`, matching hodor's single-shared-credential model.
+
 ## How It Works
 
 ```
@@ -90,10 +123,14 @@ Request → hodor
   ├─ /_gate/health → 200 ok (bypass auth)
   ├─ Has valid session cookie? → Reverse proxy to UPSTREAM
   └─ No cookie? → Show login page
-       └─ POST /_gate/login
+       ├─ POST /_gate/login
+       │    ├─ Rate limited? → 429
+       │    ├─ Password correct? → Set cookie, redirect back
+       │    └─ Wrong? → Show login page with error
+       └─ Passkey button (if ORIGIN set) → WebAuthn ceremony
             ├─ Rate limited? → 429
-            ├─ Password correct? → Set cookie, redirect back
-            └─ Wrong? → Show login page with error
+            ├─ Valid passkey? → Set cookie, redirect back
+            └─ Invalid? → Show error
 ```
 
 ### Reserved Paths
@@ -101,6 +138,10 @@ Request → hodor
 - `/_gate/login` — login form submission (POST) / redirect to gate (GET)
 - `/_gate/logout` — clears session cookie
 - `/_gate/health` — returns `ok` (for liveness/readiness probes)
+- `/_gate/passkeys` — passkey management page (requires login, needs `ORIGIN` set)
+- `/_gate/passkey/register/start|finish` — passkey registration ceremony (requires login)
+- `/_gate/passkey/login/start|finish` — passkey login ceremony
+- `/_gate/passkey/delete` — removes a registered passkey (requires login)
 
 All other paths are proxied to the upstream.
 
@@ -129,6 +170,9 @@ Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinj
 | --- | --- | --- |
 | `title` | string | The configured title (auto-escaped) |
 | `show_error` | bool | `true` when the user entered a wrong password |
+| `passkeys_enabled` | bool | `true` when passkey login is enabled (`ORIGIN` is set) |
+
+If you want passkey login on a custom template, look at how the built-in template ([`src/template.html`](src/template.html)) wires its passkey button to `/_gate/passkey/login/start` and `/_gate/passkey/login/finish` inside `{% if passkeys_enabled %}`.
 
 ### Template Example
 
