@@ -62,6 +62,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `secret` | `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
 | `title` | `TITLE` | no | `Password Required` | Login page heading |
+| `custom_css` | `CUSTOM_CSS` | no | | Extra CSS injected after the built-in styles on the login and error pages |
 | `template` | `TEMPLATE` | no | built-in | Path to a custom HTML login page template |
 | `error_template` | `ERROR_TEMPLATE` | no | built-in | Path to a custom HTML error page template |
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
@@ -112,6 +113,20 @@ All other paths are proxied to the upstream.
 - Forwards the upstream's `Host` header
 - WebSocket proxying is not yet supported (returns 501)
 
+## Custom CSS
+
+To restyle the built-in login and error pages without maintaining a full template, set `custom_css`. It is injected into a `<style>` tag after the built-in styles, so your rules take precedence:
+
+```yaml
+environment:
+  CUSTOM_CSS: |
+    body { background: #1e3a5f; }
+    .card { border-radius: 4px; }
+    button { background: #ffb703; color: #000; }
+```
+
+The CSS is emitted verbatim (not escaped), so anything valid in a `<style>` block works. For a complete redesign, use a custom template instead (below).
+
 ## Custom Login Page
 
 Hodor ships with a built-in dark-themed login page. To use your own login page, set `template` to the path of an HTML file:
@@ -129,6 +144,7 @@ Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinj
 | --- | --- | --- |
 | `title` | string | The configured title (auto-escaped) |
 | `show_error` | bool | `true` when the user entered a wrong password |
+| `custom_css` | string | The configured `custom_css` — include it with `{{ custom_css \| safe }}` to keep the override working in your template |
 
 ### Template Example
 

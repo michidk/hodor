@@ -68,6 +68,7 @@
       color: #f87171;
     }
   </style>
+  {% if custom_css %}<style>{{ custom_css | safe }}</style>{% endif %}
 </head>
 <body>
   <main class="card">
