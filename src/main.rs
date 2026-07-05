@@ -18,6 +18,7 @@ use hyper_util::rt::TokioExecutor;
 use minijinja::{Environment, context};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -33,6 +34,7 @@ use webauthn_rs::prelude::{
 };
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<Sha1>;
 
 const COOKIE_NAME: &str = "hodor";
 const BUILTIN_TEMPLATE: &str = include_str!("template.html");
@@ -46,6 +48,8 @@ const PASSKEYS_TEMPLATE_NAME: &str = "passkeys.html";
 const CHALLENGE_TTL: Duration = Duration::from_secs(300);
 const MAX_PENDING_CHALLENGES: usize = 256;
 const PASSKEY_NAME_MAX_CHARS: usize = 64;
+const TOTP_STEP_SECONDS: u64 = 30;
+const TOTP_DIGITS: u32 = 6;
 // Hodor has a single shared identity, so every passkey is registered under one fixed user handle.
 const PASSKEY_USER_ID: Uuid = Uuid::from_bytes(*b"hodor-shared-usr");
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
@@ -54,6 +58,7 @@ const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 #[derive(Clone)]
 struct AppState {
     password: Vec<u8>,
+    totp_secret: Option<Vec<u8>>,
     title: String,
     template_source: String,
     error_template_source: String,
@@ -122,6 +127,8 @@ struct PasskeyDeleteRequest {
 struct Config {
     password: String,
     upstream: String,
+    #[serde(default)]
+    totp_secret: Option<String>,
     #[serde(default = "default_listen")]
     listen: String,
     #[serde(default = "default_title")]
@@ -151,6 +158,7 @@ impl Default for Config {
         Self {
             password: String::new(),
             upstream: String::new(),
+            totp_secret: None,
             listen: default_listen(),
             title: default_title(),
             template: None,
@@ -191,6 +199,7 @@ async fn main() {
     validate_error_template(&error_template_source, &config.title)
         .expect("error template must parse and render");
     let secret = load_secret(config.secret.as_deref());
+    let totp_secret = load_totp_secret(config.totp_secret.as_deref());
     let webauthn = build_webauthn(config.origin.as_deref(), config.rp_id.as_deref());
     let passkeys = if webauthn.is_some() {
         validate_passkeys_template(BUILTIN_PASSKEYS_TEMPLATE, &config.title)
@@ -204,6 +213,7 @@ async fn main() {
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
         password: config.password.into_bytes(),
+        totp_secret,
         title: config.title,
         template_source,
         error_template_source,
@@ -230,6 +240,7 @@ async fn main() {
         custom_error_template_loaded = config.error_template.is_some(),
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
+        totp_enabled = state.totp_secret.is_some(),
         passkeys_enabled = state.webauthn.is_some(),
         passkeys_registered = passkey_count,
         log_format = %config.log_format,
@@ -307,7 +318,17 @@ async fn login_post(
     let redirect = sanitize_redirect(form_value(&form, "redirect").unwrap_or("/"));
     let password = form_value(&form, "password").unwrap_or("");
 
-    if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
+    let password_ok = bool::from(password.as_bytes().ct_eq(state.password.as_slice()));
+    let totp_ok = match &state.totp_secret {
+        Some(totp_secret) => verify_totp(
+            totp_secret,
+            form_value(&form, "totp").unwrap_or("").trim(),
+            now_unix(),
+        ),
+        None => true,
+    };
+
+    if !password_ok || !totp_ok {
         info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
         return login_page_response(&state, true);
     }
@@ -700,7 +721,7 @@ fn load_error_template(template_path: Option<&str>) -> String {
 }
 
 fn validate_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
-    render_login_page(template_source, title, false, true).map(|_| ())
+    render_login_page(template_source, title, false, true, true).map(|_| ())
 }
 
 fn validate_passkeys_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
@@ -723,6 +744,7 @@ fn render_login_page(
     title: &str,
     show_error: bool,
     passkeys_enabled: bool,
+    totp_enabled: bool,
 ) -> Result<String, minijinja::Error> {
     let mut env = Environment::new();
     env.add_template(TEMPLATE_NAME, template_source)?;
@@ -730,6 +752,7 @@ fn render_login_page(
         title => title,
         show_error => show_error,
         passkeys_enabled => passkeys_enabled,
+        totp_enabled => totp_enabled,
     ))
 }
 
@@ -767,6 +790,7 @@ fn login_page_response(state: &AppState, show_error: bool) -> Response<Body> {
         &state.title,
         show_error,
         state.webauthn.is_some(),
+        state.totp_secret.is_some(),
     ) {
         Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
         Err(error) => {
@@ -910,6 +934,76 @@ fn validate_token(secret: &[u8], token: &str) -> bool {
     };
     mac.update(expiry.to_string().as_bytes());
     mac.verify_slice(&signature).is_ok()
+}
+
+fn load_totp_secret(configured: Option<&str>) -> Option<Vec<u8>> {
+    let configured = configured?;
+    let decoded = decode_base32(configured)
+        .filter(|decoded| !decoded.is_empty())
+        .expect("TOTP_SECRET must be non-empty base32");
+    if decoded.len() < 16 {
+        warn!("TOTP_SECRET is shorter than the recommended 128 bits");
+    }
+    Some(decoded)
+}
+
+// RFC 4648 base32 (the alphabet authenticator apps use), case-insensitive; padding and spaces are ignored.
+fn decode_base32(input: &str) -> Option<Vec<u8>> {
+    let mut buffer = 0_u64;
+    let mut bit_count = 0_u32;
+    let mut decoded = Vec::new();
+
+    for character in input.chars() {
+        if character == '=' || character == ' ' {
+            continue;
+        }
+        let value = match character.to_ascii_uppercase() {
+            character @ 'A'..='Z' => character as u64 - 'A' as u64,
+            character @ '2'..='7' => character as u64 - '2' as u64 + 26,
+            _ => return None,
+        };
+        buffer = (buffer << 5) | value;
+        bit_count += 5;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            decoded.push((buffer >> bit_count) as u8);
+        }
+    }
+
+    Some(decoded)
+}
+
+// RFC 6238 TOTP: HMAC-SHA1, 30-second steps, 6 digits, accepting one step of clock skew either way.
+fn verify_totp(secret: &[u8], code: &str, now: u64) -> bool {
+    if code.len() != TOTP_DIGITS as usize || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+
+    let step = now / TOTP_STEP_SECONDS;
+    [step.saturating_sub(1), step, step + 1]
+        .iter()
+        .any(|candidate| {
+            bool::from(
+                totp_code(secret, *candidate)
+                    .as_bytes()
+                    .ct_eq(code.as_bytes()),
+            )
+        })
+}
+
+fn totp_code(secret: &[u8], step: u64) -> String {
+    let mut mac = HmacSha1::new_from_slice(secret).expect("valid HMAC key");
+    mac.update(&step.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[digest.len() - 1] & 0x0f) as usize;
+    let binary = u32::from_be_bytes([
+        digest[offset] & 0x7f,
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]);
+    let code = binary % 10_u32.pow(TOTP_DIGITS);
+    format!("{code:0width$}", width = TOTP_DIGITS as usize)
 }
 
 fn build_webauthn(origin: Option<&str>, rp_id: Option<&str>) -> Option<Arc<Webauthn>> {
@@ -1222,6 +1316,7 @@ mod tests {
     fn test_state(secure_cookie: bool) -> AppState {
         AppState {
             password: b"hunter2".to_vec(),
+            totp_secret: None,
             title: "Test".to_string(),
             template_source: BUILTIN_TEMPLATE.to_string(),
             error_template_source: BUILTIN_ERROR_TEMPLATE.to_string(),
@@ -1626,27 +1721,106 @@ mod tests {
 
     #[test]
     fn render_login_page_includes_title() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", false, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", false, false, false).unwrap();
         assert!(html.contains("My Gate"));
     }
 
     #[test]
     fn render_login_page_escapes_title() {
-        let html =
-            render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", false, false).unwrap();
+        let html = render_login_page(
+            BUILTIN_TEMPLATE,
+            "<script>xss</script>",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(!html.contains("<script>xss</script>"));
     }
 
     #[test]
     fn render_login_page_shows_passkey_button_when_enabled() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, true).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, true, false).unwrap();
         assert!(html.contains("passkey-button"));
     }
 
     #[test]
     fn render_login_page_hides_passkey_button_when_disabled() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, false, false).unwrap();
         assert!(!html.contains("passkey-button"));
+    }
+
+    #[test]
+    fn render_login_page_shows_totp_field_when_enabled() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, false, true).unwrap();
+        assert!(html.contains("name=\"totp\""));
+        assert!(html.contains("Wrong password or code."));
+    }
+
+    #[test]
+    fn render_login_page_hides_totp_field_when_disabled() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "Test", false, false, false).unwrap();
+        assert!(!html.contains("name=\"totp\""));
+        assert!(html.contains("Wrong password."));
+    }
+
+    #[test]
+    fn decode_base32_known_vectors() {
+        assert_eq!(decode_base32("MZXW6==="), Some(b"foo".to_vec()));
+        assert_eq!(decode_base32("MZXW6YTBOI======"), Some(b"foobar".to_vec()));
+        assert_eq!(decode_base32(""), Some(Vec::new()));
+    }
+
+    #[test]
+    fn decode_base32_is_case_insensitive_and_ignores_spaces() {
+        assert_eq!(decode_base32("mzxw6"), Some(b"foo".to_vec()));
+        assert_eq!(decode_base32("MZ XW 6"), Some(b"foo".to_vec()));
+    }
+
+    #[test]
+    fn decode_base32_rejects_invalid_characters() {
+        assert_eq!(decode_base32("MZXW61"), None);
+        assert_eq!(decode_base32("!@#"), None);
+        assert_eq!(decode_base32("MZXW0"), None);
+    }
+
+    // RFC 6238 appendix B test vectors (SHA-1, truncated to 6 digits).
+    #[test]
+    fn totp_code_matches_rfc_6238_vectors() {
+        let secret = b"12345678901234567890";
+        assert_eq!(totp_code(secret, 59 / 30), "287082");
+        assert_eq!(totp_code(secret, 1_111_111_109 / 30), "081804");
+        assert_eq!(totp_code(secret, 1_111_111_111 / 30), "050471");
+        assert_eq!(totp_code(secret, 1_234_567_890 / 30), "005924");
+        assert_eq!(totp_code(secret, 2_000_000_000 / 30), "279037");
+    }
+
+    #[test]
+    fn verify_totp_accepts_current_code() {
+        let secret = b"12345678901234567890";
+        assert!(verify_totp(secret, "287082", 59));
+    }
+
+    #[test]
+    fn verify_totp_accepts_adjacent_windows() {
+        let secret = b"12345678901234567890";
+        assert!(verify_totp(secret, "287082", 59 + 30));
+        assert!(verify_totp(secret, "287082", 29));
+    }
+
+    #[test]
+    fn verify_totp_rejects_stale_code() {
+        let secret = b"12345678901234567890";
+        assert!(!verify_totp(secret, "287082", 59 + 61));
+    }
+
+    #[test]
+    fn verify_totp_rejects_malformed_codes() {
+        let secret = b"12345678901234567890";
+        assert!(!verify_totp(secret, "", 59));
+        assert!(!verify_totp(secret, "28708", 59));
+        assert!(!verify_totp(secret, "2870822", 59));
+        assert!(!verify_totp(secret, "28708a", 59));
     }
 
     #[test]

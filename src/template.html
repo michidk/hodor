@@ -37,7 +37,8 @@
       font-size: 0.95rem;
       color: #d4d4d4;
     }
-    input[type="password"] {
+    input[type="password"],
+    input[type="text"] {
       width: 100%;
       padding: 12px 14px;
       border: 1px solid #2a2a2a;
@@ -90,11 +91,15 @@
 <body>
   <main class="card">
     <h1>{{ title }}</h1>
-    <div class="error">Wrong password.</div>
+    <div class="error">{% if totp_enabled %}Wrong password or code.{% else %}Wrong password.{% endif %}</div>
     <form method="post" action="/_gate/login">
       <input type="hidden" name="redirect" value="/">
       <label for="password">Password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+      {% if totp_enabled %}
+      <label for="totp">One-time code</label>
+      <input id="totp" name="totp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+      {% endif %}
       <button type="submit">Continue</button>
     </form>
     {% if passkeys_enabled %}

@@ -5,6 +5,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 ## Features
 
 - Single shared password — no user accounts, no database
+- Optional two-factor authentication — require a TOTP one-time code alongside the password
 - Optional passkey (WebAuthn) login — register passkeys once, skip the password after that
 - Clean dark-themed login page (or bring your own with Jinja2 templates)
 - Runs as a Docker sidecar in front of any web app
@@ -60,6 +61,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | --- | --- | --- | --- | --- |
 | `password` | `PASSWORD` | yes | | The shared password |
 | `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`) |
+| `totp_secret` | `TOTP_SECRET` | no | | Base32 TOTP secret. Setting it requires a one-time code at login ([details](#two-factor-authentication-totp)) |
 | `secret` | `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
 | `title` | `TITLE` | no | `Password Required` | Login page heading |
@@ -86,6 +88,29 @@ secure_cookie = true
 ```
 
 Environment variables always win. Set `PASSWORD=override` and it takes precedence over `password` in the TOML file.
+
+## Two-Factor Authentication (TOTP)
+
+Hodor can require a one-time code from an authenticator app (Google Authenticator, 1Password, Aegis, ...) in addition to the password. Like everything in hodor, it's a single shared credential: one secret for everyone who uses the gate.
+
+1. Generate a base32 secret:
+
+   ```sh
+   openssl rand 20 | base32
+   ```
+
+2. Set it as `TOTP_SECRET`. The login page now shows a **One-time code** field, and logins need both the password and a current code.
+
+3. Add the secret to your authenticator app — enter it manually, or turn this URI into a QR code:
+
+   ```
+   otpauth://totp/hodor?secret=<TOTP_SECRET>&issuer=hodor
+   ```
+
+Notes:
+
+- Codes are standard RFC 6238 TOTP (SHA-1, 30-second period, 6 digits) — the defaults in every authenticator app. Hodor tolerates one step of clock skew, so keep the server clock NTP-synced.
+- Passkey login is unaffected: a passkey with required user verification already covers two factors (possession + PIN/biometric), so it skips the code.
 
 ## Passkeys
 
@@ -125,7 +150,7 @@ Request → hodor
   └─ No cookie? → Show login page
        ├─ POST /_gate/login
        │    ├─ Rate limited? → 429
-       │    ├─ Password correct? → Set cookie, redirect back
+       │    ├─ Password (+ TOTP code, if enabled) correct? → Set cookie, redirect back
        │    └─ Wrong? → Show login page with error
        └─ Passkey button (if ORIGIN set) → WebAuthn ceremony
             ├─ Rate limited? → 429
@@ -169,8 +194,9 @@ Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinj
 | Variable | Type | Description |
 | --- | --- | --- |
 | `title` | string | The configured title (auto-escaped) |
-| `show_error` | bool | `true` when the user entered a wrong password |
+| `show_error` | bool | `true` when the user entered wrong credentials |
 | `passkeys_enabled` | bool | `true` when passkey login is enabled (`ORIGIN` is set) |
+| `totp_enabled` | bool | `true` when 2FA is enabled (`TOTP_SECRET` is set) |
 
 If you want passkey login on a custom template, look at how the built-in template ([`src/template.html`](src/template.html)) wires its passkey button to `/_gate/passkey/login/start` and `/_gate/passkey/login/finish` inside `{% if passkeys_enabled %}`.
 
@@ -246,6 +272,7 @@ The built-in template ([`src/template.html`](src/template.html)) is a good start
 1. The form **must** POST to `/_gate/login` with a `password` field
 2. Include a `redirect` hidden field (populated via JS) so users return to the page they were trying to access
 3. Use `{% if show_error %}` to conditionally show error messages
+4. If you use 2FA, include a `totp` field (inside `{% if totp_enabled %}`) — without it, logins will always fail while `TOTP_SECRET` is set
 
 ## Custom Error Page
 
