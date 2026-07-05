@@ -40,6 +40,7 @@ const LOCKOUT_BASE: Duration = Duration::from_secs(60);
 const LOCKOUT_MAX: Duration = Duration::from_secs(3600);
 const FAILED_LOGIN_DELAY: Duration = Duration::from_millis(500);
 const MAX_TRACKED_IPS: usize = 10_000;
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_TEMPLATE_NAME: &str = "error.html";
 const TEMPLATE_NAME: &str = "login.html";
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
@@ -61,8 +62,26 @@ struct AppState {
     session_ttl: Duration,
     secure_cookie: bool,
     trust_proxy: bool,
-    login_guard: Arc<Mutex<HashMap<IpAddr, LoginRecord>>>,
+    login_guard: Arc<Mutex<LoginGuard>>,
     client: Client<HttpConnector, Body>,
+}
+
+// Brute-force tracker shared across handlers. `last_pruned` throttles the
+// full-map cleanup so it runs at most once per PRUNE_INTERVAL rather than on
+// every login attempt.
+#[derive(Debug)]
+struct LoginGuard {
+    records: HashMap<IpAddr, LoginRecord>,
+    last_pruned: Instant,
+}
+
+impl LoginGuard {
+    fn new(now: Instant) -> Self {
+        Self {
+            records: HashMap::new(),
+            last_pruned: now,
+        }
+    }
 }
 
 // Brute-force protection state per client IP. A sliding window throttles
@@ -190,7 +209,7 @@ async fn main() {
         session_ttl: Duration::from_secs(config.session_ttl),
         secure_cookie: config.secure_cookie,
         trust_proxy: config.trust_proxy,
-        login_guard: Arc::new(Mutex::new(HashMap::new())),
+        login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
         client,
     };
 
@@ -564,12 +583,18 @@ fn check_login_attempt(state: &AppState, ip: IpAddr) -> Option<Duration> {
     let now = Instant::now();
     let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
 
-    prune_login_records(&mut guard, now);
-    if !guard.contains_key(&ip) && guard.len() >= MAX_TRACKED_IPS {
-        evict_oldest_record(&mut guard);
+    if now.saturating_duration_since(guard.last_pruned) >= PRUNE_INTERVAL {
+        prune_login_records(&mut guard.records, now);
+        guard.last_pruned = now;
+    }
+    if !guard.records.contains_key(&ip) && guard.records.len() >= MAX_TRACKED_IPS {
+        evict_oldest_record(&mut guard.records);
     }
 
-    let record = guard.entry(ip).or_insert_with(|| LoginRecord::new(now));
+    let record = guard
+        .records
+        .entry(ip)
+        .or_insert_with(|| LoginRecord::new(now));
     record.last_seen = now;
 
     if let Some(locked_until) = record.locked_until {
@@ -597,7 +622,10 @@ fn record_login_failure(state: &AppState, ip: IpAddr) -> Option<Duration> {
     let now = Instant::now();
     let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
 
-    let record = guard.entry(ip).or_insert_with(|| LoginRecord::new(now));
+    let record = guard
+        .records
+        .entry(ip)
+        .or_insert_with(|| LoginRecord::new(now));
     record.last_seen = now;
     record.consecutive_failures = record.consecutive_failures.saturating_add(1);
 
@@ -612,7 +640,7 @@ fn record_login_failure(state: &AppState, ip: IpAddr) -> Option<Duration> {
 
 fn record_login_success(state: &AppState, ip: IpAddr) {
     let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
-    guard.remove(&ip);
+    guard.records.remove(&ip);
 }
 
 fn lockout_duration(exponent: u32) -> Duration {
@@ -639,7 +667,8 @@ fn evict_oldest_record(records: &mut HashMap<IpAddr, LoginRecord>) {
 
 fn too_many_requests(retry_after: Duration) -> Response<Body> {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, "too many login attempts").into_response();
-    let seconds = retry_after.as_secs().max(1);
+    let rounded_up = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+    let seconds = rounded_up.max(1);
     if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
         response.headers_mut().insert(RETRY_AFTER, value);
     }
@@ -975,7 +1004,7 @@ mod tests {
             session_ttl: Duration::from_secs(3600),
             secure_cookie,
             trust_proxy: false,
-            login_guard: Arc::new(Mutex::new(HashMap::new())),
+            login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
             client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
         }
     }
@@ -1281,13 +1310,13 @@ mod tests {
         }
         {
             let guard = state.login_guard.lock().unwrap();
-            assert_eq!(guard.len(), MAX_TRACKED_IPS);
+            assert_eq!(guard.records.len(), MAX_TRACKED_IPS);
         }
         let newcomer: IpAddr = "203.0.113.1".parse().unwrap();
         assert!(check_login_attempt(&state, newcomer).is_none());
         let guard = state.login_guard.lock().unwrap();
-        assert_eq!(guard.len(), MAX_TRACKED_IPS);
-        assert!(guard.contains_key(&newcomer));
+        assert_eq!(guard.records.len(), MAX_TRACKED_IPS);
+        assert!(guard.records.contains_key(&newcomer));
     }
 
     #[test]
@@ -1371,6 +1400,18 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "1"
+        );
+
+        // Sub-second remainders round up so clients don't retry too early.
+        let response = too_many_requests(Duration::from_millis(1900));
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2"
         );
     }
 
