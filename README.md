@@ -63,6 +63,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
 | `title` | `TITLE` | no | `Password Required` | Login page heading |
 | `custom_css` | `CUSTOM_CSS` | no | | Extra CSS injected after the built-in styles on the login and error pages |
+| `disable_default_css` | `DISABLE_DEFAULT_CSS` | no | `false` | Set `true` to drop the built-in styles entirely (style from scratch with `custom_css`) |
 | `template` | `TEMPLATE` | no | built-in | Path to a custom HTML login page template |
 | `error_template` | `ERROR_TEMPLATE` | no | built-in | Path to a custom HTML error page template |
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
@@ -125,7 +126,19 @@ environment:
     button { background: #ffb703; color: #000; }
 ```
 
-The CSS is emitted verbatim (not escaped), so anything valid in a `<style>` block works. For a complete redesign, use a custom template instead (below).
+The CSS is emitted verbatim (not escaped), so anything valid in a `<style>` block works.
+
+To start from a blank slate instead of overriding the dark theme, set `disable_default_css` — the built-in styles are dropped entirely and only your CSS applies:
+
+```yaml
+environment:
+  DISABLE_DEFAULT_CSS: "true"
+  CUSTOM_CSS: |
+    body { font-family: system-ui; display: grid; place-items: center; min-height: 100vh; }
+    .card { max-width: 400px; padding: 32px; border: 1px solid #ddd; border-radius: 12px; }
+```
+
+The built-in markup keeps the same structure and class names (`.card`, `.error`, `.actions`), so your stylesheet can target them directly. For different markup entirely, use a custom template instead (below).
 
 ## Custom Login Page
 
@@ -145,6 +158,7 @@ Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinj
 | `title` | string | The configured title (auto-escaped) |
 | `show_error` | bool | `true` when the user entered a wrong password |
 | `custom_css` | string | The configured `custom_css` — include it with `{{ custom_css \| safe }}` to keep the override working in your template |
+| `disable_default_css` | bool | `true` when `disable_default_css` is set — custom templates can use it to gate their own base styles |
 
 ### Template Example
 
@@ -238,6 +252,8 @@ The built-in error template ([`src/error_template.html`](src/error_template.html
 | `status_code` | number | HTTP status code such as `502` or `501` |
 | `heading` | string | Short error heading |
 | `message` | string | Human-readable error message |
+| `custom_css` | string | The configured `custom_css` — include it with `{{ custom_css \| safe }}` to keep the override working in your template |
+| `disable_default_css` | bool | `true` when `disable_default_css` is set — custom templates can use it to gate their own base styles |
 
 ## Building from Source
 

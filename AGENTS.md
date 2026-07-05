@@ -22,7 +22,7 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 - **AppState**: shared runtime state (config-derived values, rate limiter, HTTP client)
 - **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET
 - **Rate limiter**: in-memory `HashMap<IpAddr, Vec<Instant>>` behind `Arc<Mutex<_>>`, 5 attempts per 60s per IP
-- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config; extra CSS via `CUSTOM_CSS` (injected after the built-in styles, unescaped). Login variables: `title`, `show_error`, `custom_css`. Error variables: `title`, `status_code`, `heading`, `message`, `custom_css`.
+- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config; extra CSS via `CUSTOM_CSS` (injected after the built-in styles, unescaped); `DISABLE_DEFAULT_CSS` drops the built-in styles entirely. Login variables: `title`, `show_error`, `custom_css`, `disable_default_css`. Error variables: `title`, `status_code`, `heading`, `message`, `custom_css`, `disable_default_css`.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 
 ### Dependencies

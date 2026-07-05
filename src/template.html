@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
-  <style>
+  {% if not disable_default_css %}<style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
     body {
@@ -67,7 +67,7 @@
       background: rgba(127, 29, 29, 0.35);
       color: #f87171;
     }
-  </style>
+  </style>{% endif %}
   {% if custom_css %}<style>{{ custom_css | safe }}</style>{% endif %}
 </head>
 <body>
