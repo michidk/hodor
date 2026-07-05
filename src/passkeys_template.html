@@ -139,8 +139,11 @@
       error.style.display = 'block';
     };
 
-    const b64uToBuf = (value) =>
-      Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)).buffer;
+    const b64uToBuf = (value) => {
+      const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+      const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+      return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0)).buffer;
+    };
     const bufToB64u = (buffer) =>
       btoa(String.fromCharCode(...new Uint8Array(buffer)))
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -189,13 +192,17 @@
 
     for (const button of document.querySelectorAll('button.remove')) {
       button.addEventListener('click', async () => {
-        const response = await fetch('/_gate/passkey/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: button.dataset.id }),
-        });
-        if (!response.ok) return fail(await response.text());
-        window.location.reload();
+        try {
+          const response = await fetch('/_gate/passkey/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: button.dataset.id }),
+          });
+          if (!response.ok) return fail(await response.text());
+          window.location.reload();
+        } catch (err) {
+          fail('Failed to remove passkey.');
+        }
       });
     }
   </script>

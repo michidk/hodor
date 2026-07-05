@@ -128,8 +128,11 @@
         error.style.display = 'block';
       };
 
-      const b64uToBuf = (value) =>
-        Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)).buffer;
+      const b64uToBuf = (value) => {
+        const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+        const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+        return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0)).buffer;
+      };
       const bufToB64u = (buffer) =>
         btoa(String.fromCharCode(...new Uint8Array(buffer)))
           .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');

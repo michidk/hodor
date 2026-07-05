@@ -99,6 +99,12 @@ Hodor can require a one-time code from an authenticator app (Google Authenticato
    openssl rand 20 | base32
    ```
 
+   `base32` comes from GNU coreutils (preinstalled on most Linux). On macOS, either `brew install coreutils` and use `gbase32`, or use a portable fallback:
+
+   ```sh
+   openssl rand 20 | python3 -c 'import sys, base64; print(base64.b32encode(sys.stdin.buffer.read()).decode())'
+   ```
+
 2. Set it as `TOTP_SECRET`. The login page now shows a **One-time code** field, and logins need both the password and a current code.
 
 3. Add the secret to your authenticator app — enter it manually, or turn this URI into a QR code:

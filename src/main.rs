@@ -551,10 +551,8 @@ async fn passkey_login_finish(
                 changed = true;
             }
         }
-        if changed {
-            if let Err(error) = save_passkeys(&state.passkeys_file, &records) {
-                warn!(%error, "failed to persist passkey counter update");
-            }
+        if changed && let Err(error) = save_passkeys(&state.passkeys_file, &records) {
+            warn!(%error, "failed to persist passkey counter update");
         }
     }
 
