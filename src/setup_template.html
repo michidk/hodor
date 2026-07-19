@@ -31,6 +31,11 @@
       font-size: 1.5rem;
       font-weight: 700;
     }
+    p {
+      margin: 0 0 20px;
+      color: #d4d4d4;
+      line-height: 1.5;
+    }
     label {
       display: block;
       margin-bottom: 8px;
@@ -73,12 +78,15 @@
 <body>
   <main class="card">
     <h1>{{ title }}</h1>
+    <p>Create your password to finish setting up this hodor instance.</p>
     <div class="error">{{ error_message }}</div>
     <form method="post" action="/_gate/login">
       <input type="hidden" name="redirect" value="/">
       <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
-      <button type="submit">Continue</button>
+      <input id="password" name="password" type="password" autocomplete="new-password" autofocus required>
+      <label for="password_confirm">Confirm password</label>
+      <input id="password_confirm" name="password_confirm" type="password" autocomplete="new-password" required>
+      <button type="submit">Set password</button>
     </form>
   </main>
   <script>

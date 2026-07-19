@@ -31,6 +31,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "hodor";
 const BUILTIN_TEMPLATE: &str = include_str!("template.html");
+const BUILTIN_SETUP_TEMPLATE: &str = include_str!("setup_template.html");
 const BUILTIN_ERROR_TEMPLATE: &str = include_str!("error_template.html");
 const RATE_LIMIT_ATTEMPTS: usize = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -42,16 +43,18 @@ const MAX_TRACKED_IPS: usize = 10_000;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_TEMPLATE_NAME: &str = "error.html";
 const TEMPLATE_NAME: &str = "login.html";
+const SETUP_TEMPLATE_NAME: &str = "setup.html";
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 
 #[derive(Clone)]
 struct AppState {
-    password: Vec<u8>,
+    password: Arc<Mutex<Option<Vec<u8>>>>,
     title: String,
     custom_css: String,
     disable_default_css: bool,
     template_source: String,
+    setup_template_source: String,
     error_template_source: String,
     secret: Vec<u8>,
     upstream: Uri,
@@ -108,7 +111,8 @@ impl LoginRecord {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Config {
-    password: String,
+    #[serde(default)]
+    password: Option<String>,
     upstream: String,
     #[serde(default = "default_listen")]
     listen: String,
@@ -120,6 +124,8 @@ struct Config {
     disable_default_css: bool,
     #[serde(default)]
     template: Option<String>,
+    #[serde(default)]
+    setup_template: Option<String>,
     #[serde(default)]
     error_template: Option<String>,
     #[serde(default)]
@@ -137,13 +143,14 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            password: String::new(),
+            password: None,
             upstream: String::new(),
             listen: default_listen(),
             title: default_title(),
             custom_css: None,
             disable_default_css: false,
             template: None,
+            setup_template: None,
             error_template: None,
             secret: None,
             session_ttl: default_session_ttl(),
@@ -182,6 +189,14 @@ async fn main() {
         config.disable_default_css,
     )
     .expect("template must parse and render");
+    let setup_template_source = load_setup_template(config.setup_template.as_deref());
+    validate_setup_template(
+        &setup_template_source,
+        &config.title,
+        &custom_css,
+        config.disable_default_css,
+    )
+    .expect("setup template must parse and render");
     let error_template_source = load_error_template(config.error_template.as_deref());
     validate_error_template(
         &error_template_source,
@@ -191,14 +206,24 @@ async fn main() {
     )
     .expect("error template must parse and render");
     let secret = load_secret(config.secret.as_deref());
+    let password_configured = config
+        .password
+        .as_deref()
+        .is_some_and(|password| !password.is_empty());
 
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
-        password: config.password.into_bytes(),
+        password: Arc::new(Mutex::new(
+            config
+                .password
+                .filter(|password| !password.is_empty())
+                .map(String::into_bytes),
+        )),
         title: config.title,
         custom_css,
         disable_default_css: config.disable_default_css,
         template_source,
+        setup_template_source,
         error_template_source,
         secret,
         upstream,
@@ -216,9 +241,11 @@ async fn main() {
         listen_addr = %listen_addr,
         upstream = %state.upstream,
         custom_template_loaded = config.template.is_some(),
+        custom_setup_template_loaded = config.setup_template.is_some(),
         custom_error_template_loaded = config.error_template.is_some(),
         custom_css_set = !state.custom_css.is_empty(),
         disable_default_css = state.disable_default_css,
+        password_configured,
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
         trust_proxy = state.trust_proxy,
@@ -271,11 +298,6 @@ async fn login_post(
 ) -> Response<Body> {
     let client_ip = resolve_client_ip(request.headers(), addr.ip(), state.trust_proxy);
 
-    if let Some(retry_after) = check_login_attempt(&state, client_ip) {
-        info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
-        return too_many_requests(retry_after);
-    }
-
     let body = match collect_body(request.into_body()).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -284,30 +306,46 @@ async fn login_post(
     let form = parse_form_body(&body);
     let redirect = sanitize_redirect(form_value(&form, "redirect").unwrap_or("/"));
     let password = form_value(&form, "password").unwrap_or("");
+    let password_confirm = form_value(&form, "password_confirm").unwrap_or("");
 
-    if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
+    if !password_is_configured(&state) {
+        if password.is_empty() {
+            info!(client_ip = %client_ip, success = false, setup = true, reason = "empty_password", "login attempt");
+            return setup_page_response(&state, true, "Password cannot be empty.");
+        }
+
+        if password != password_confirm {
+            info!(client_ip = %client_ip, success = false, setup = true, reason = "confirmation_mismatch", "login attempt");
+            return setup_page_response(&state, true, "Passwords do not match.");
+        }
+
+        if set_password_if_missing(&state, password) {
+            info!(client_ip = %client_ip, success = true, setup = true, "login attempt");
+            return authenticated_response(&state, &redirect);
+        }
+    }
+
+    if let Some(retry_after) = check_login_attempt(&state, client_ip) {
+        info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
+        return too_many_requests(retry_after);
+    }
+
+    let Some(configured_password) = configured_password(&state) else {
+        return setup_page_response(&state, false, "");
+    };
+
+    if !bool::from(password.as_bytes().ct_eq(configured_password.as_slice())) {
         if let Some(lockout) = record_login_failure(&state, client_ip) {
             warn!(client_ip = %client_ip, lockout_secs = lockout.as_secs(), "locking out ip after repeated failed logins");
         }
         info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        return login_page_response(&state, true);
+        return login_page_response(&state, true, "Wrong password.");
     }
 
     record_login_success(&state, client_ip);
-
-    let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
-    let cookie = session_cookie(&state, &token);
-
-    let mut response = Redirect::to(&redirect).into_response();
-    match HeaderValue::from_str(&cookie) {
-        Ok(value) => {
-            info!(client_ip = %client_ip, success = true, rate_limited = false, "login attempt");
-            response.headers_mut().insert(SET_COOKIE, value);
-            response
-        }
-        Err(_) => internal_server_error(&state),
-    }
+    info!(client_ip = %client_ip, success = true, rate_limited = false, "login attempt");
+    authenticated_response(&state, &redirect)
 }
 
 async fn proxy_or_login(
@@ -315,8 +353,12 @@ async fn proxy_or_login(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
+    if !password_is_configured(&state) {
+        return setup_page_response(&state, false, "");
+    }
+
     if !is_authenticated(request.headers(), &state.secret) {
-        return login_page_response(&state, false);
+        return login_page_response(&state, false, "Wrong password.");
     }
 
     proxy_request(state, addr, request).await
@@ -418,6 +460,14 @@ fn load_template(template_path: Option<&str>) -> String {
     }
 }
 
+fn load_setup_template(template_path: Option<&str>) -> String {
+    match template_path {
+        Some(path) => std::fs::read_to_string(path)
+            .expect("failed to read custom setup template from SETUP_TEMPLATE path"),
+        None => BUILTIN_SETUP_TEMPLATE.to_string(),
+    }
+}
+
 fn load_error_template(template_path: Option<&str>) -> String {
     match template_path {
         Some(path) => std::fs::read_to_string(path)
@@ -438,6 +488,24 @@ fn validate_template(
         custom_css,
         disable_default_css,
         false,
+        "Wrong password.",
+    )
+    .map(|_| ())
+}
+
+fn validate_setup_template(
+    template_source: &str,
+    title: &str,
+    custom_css: &str,
+    disable_default_css: bool,
+) -> Result<(), minijinja::Error> {
+    render_setup_page(
+        template_source,
+        title,
+        custom_css,
+        disable_default_css,
+        false,
+        "",
     )
     .map(|_| ())
 }
@@ -466,6 +534,7 @@ fn render_login_page(
     custom_css: &str,
     disable_default_css: bool,
     show_error: bool,
+    error_message: &str,
 ) -> Result<String, minijinja::Error> {
     let mut env = Environment::new();
     env.add_template(TEMPLATE_NAME, template_source)?;
@@ -474,6 +543,26 @@ fn render_login_page(
         custom_css => custom_css,
         disable_default_css => disable_default_css,
         show_error => show_error,
+        error_message => error_message,
+    ))
+}
+
+fn render_setup_page(
+    template_source: &str,
+    title: &str,
+    custom_css: &str,
+    disable_default_css: bool,
+    show_error: bool,
+    error_message: &str,
+) -> Result<String, minijinja::Error> {
+    let mut env = Environment::new();
+    env.add_template(SETUP_TEMPLATE_NAME, template_source)?;
+    env.get_template(SETUP_TEMPLATE_NAME)?.render(context!(
+    title => title,
+    custom_css => custom_css,
+    disable_default_css => disable_default_css,
+    show_error => show_error,
+    error_message => error_message,
     ))
 }
 
@@ -498,19 +587,77 @@ fn render_error_page(
     ))
 }
 
-fn login_page_response(state: &AppState, show_error: bool) -> Response<Body> {
+fn login_page_response(state: &AppState, show_error: bool, error_message: &str) -> Response<Body> {
     match render_login_page(
         &state.template_source,
         &state.title,
         &state.custom_css,
         state.disable_default_css,
         show_error,
+        error_message,
     ) {
         Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
         Err(error) => {
             warn!(%error, "failed to render login page");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
+    }
+}
+
+fn setup_page_response(state: &AppState, show_error: bool, error_message: &str) -> Response<Body> {
+    match render_setup_page(
+        &state.setup_template_source,
+        &state.title,
+        &state.custom_css,
+        state.disable_default_css,
+        show_error,
+        error_message,
+    ) {
+        Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
+        Err(error) => {
+            warn!(%error, "failed to render setup page");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+fn configured_password(state: &AppState) -> Option<Vec<u8>> {
+    state
+        .password
+        .lock()
+        .expect("password lock poisoned")
+        .clone()
+}
+
+fn password_is_configured(state: &AppState) -> bool {
+    state
+        .password
+        .lock()
+        .expect("password lock poisoned")
+        .is_some()
+}
+
+fn set_password_if_missing(state: &AppState, password: &str) -> bool {
+    let mut configured_password = state.password.lock().expect("password lock poisoned");
+    if configured_password.is_some() {
+        return false;
+    }
+
+    *configured_password = Some(password.as_bytes().to_vec());
+    true
+}
+
+fn authenticated_response(state: &AppState, redirect: &str) -> Response<Body> {
+    let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
+    let cookie = session_cookie(state, &token);
+
+    let mut response = Redirect::to(redirect).into_response();
+    match HeaderValue::from_str(&cookie) {
+        Ok(value) => {
+            response.headers_mut().insert(SET_COOKIE, value);
+            response
+        }
+        Err(_) => internal_server_error(state),
     }
 }
 
@@ -989,11 +1136,12 @@ mod tests {
 
     fn test_state(secure_cookie: bool) -> AppState {
         AppState {
-            password: b"hunter2".to_vec(),
+            password: Arc::new(Mutex::new(Some(b"hunter2".to_vec()))),
             title: "Test".to_string(),
             custom_css: String::new(),
             disable_default_css: false,
             template_source: BUILTIN_TEMPLATE.to_string(),
+            setup_template_source: BUILTIN_SETUP_TEMPLATE.to_string(),
             error_template_source: BUILTIN_ERROR_TEMPLATE.to_string(),
             secret: test_secret(),
             upstream: "http://localhost:3000".parse().unwrap(),
@@ -1002,6 +1150,28 @@ mod tests {
             upstream_base_path: String::new(),
             session_ttl: Duration::from_secs(3600),
             secure_cookie,
+            trust_proxy: false,
+            login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
+            client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
+        }
+    }
+
+    fn test_state_without_password() -> AppState {
+        AppState {
+            password: Arc::new(Mutex::new(None)),
+            title: "Test".to_string(),
+            custom_css: String::new(),
+            disable_default_css: false,
+            template_source: BUILTIN_TEMPLATE.to_string(),
+            setup_template_source: BUILTIN_SETUP_TEMPLATE.to_string(),
+            error_template_source: BUILTIN_ERROR_TEMPLATE.to_string(),
+            secret: test_secret(),
+            upstream: "http://localhost:3000".parse().unwrap(),
+            upstream_scheme: "http".to_string(),
+            upstream_authority: "localhost:3000".to_string(),
+            upstream_base_path: String::new(),
+            session_ttl: Duration::from_secs(3600),
+            secure_cookie: false,
             trust_proxy: false,
             login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
             client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
@@ -1433,6 +1603,16 @@ mod tests {
     }
 
     #[test]
+    fn password_helpers_track_bootstrap_state() {
+        let state = test_state_without_password();
+        assert!(!password_is_configured(&state));
+        assert!(set_password_if_missing(&state, "new-password"));
+        assert!(password_is_configured(&state));
+        assert_eq!(configured_password(&state), Some(b"new-password".to_vec()));
+        assert!(!set_password_if_missing(&state, "other-password"));
+    }
+
+    #[test]
     fn clear_cookie_sets_max_age_zero() {
         let state = test_state(false);
         let cookie = clear_cookie(&state);
@@ -1546,6 +1726,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_setup_template_accepts_builtin() {
+        assert!(validate_setup_template(BUILTIN_SETUP_TEMPLATE, "Test", "", false).is_ok());
+    }
+
+    #[test]
+    fn validate_setup_template_rejects_invalid_syntax() {
+        assert!(validate_setup_template("{% invalid %}", "Test", "", false).is_err());
+    }
+
+    #[test]
     fn validate_error_template_accepts_builtin() {
         assert!(validate_error_template(BUILTIN_ERROR_TEMPLATE, "Test", "", false).is_ok());
     }
@@ -1557,34 +1747,78 @@ mod tests {
 
     #[test]
     fn render_login_page_includes_title() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false, "").unwrap();
         assert!(html.contains("My Gate"));
     }
 
     #[test]
     fn render_login_page_escapes_title() {
-        let html =
-            render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", "", false, false).unwrap();
+        let html = render_login_page(
+            BUILTIN_TEMPLATE,
+            "<script>xss</script>",
+            "",
+            false,
+            false,
+            "",
+        )
+        .unwrap();
         assert!(!html.contains("<script>xss</script>"));
+    }
+
+    #[test]
+    fn render_setup_page_shows_setup_fields() {
+        let html =
+            render_setup_page(BUILTIN_SETUP_TEMPLATE, "My Gate", "", false, false, "").unwrap();
+        assert!(html.contains("Create your password"));
+        assert!(html.contains("password_confirm"));
+        assert!(html.contains("Set password"));
+    }
+
+    #[test]
+    fn render_login_page_includes_custom_error_message() {
+        let html = render_login_page(
+            BUILTIN_TEMPLATE,
+            "My Gate",
+            "",
+            false,
+            true,
+            "Wrong password.",
+        )
+        .unwrap();
+        assert!(html.contains("Wrong password."));
+    }
+
+    #[test]
+    fn render_setup_page_includes_custom_error_message() {
+        let html = render_setup_page(
+            BUILTIN_SETUP_TEMPLATE,
+            "My Gate",
+            "",
+            false,
+            true,
+            "Passwords do not match.",
+        )
+        .unwrap();
+        assert!(html.contains("Passwords do not match."));
     }
 
     #[test]
     fn render_login_page_includes_custom_css_verbatim() {
         let css = ".card > button { background: \"hotpink\"; }";
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", css, false, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", css, false, false, "").unwrap();
         assert!(html.contains(css));
     }
 
     #[test]
     fn render_login_page_omits_custom_css_block_when_unset() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false, "").unwrap();
         assert_eq!(html.matches("<style>").count(), 1);
     }
 
     #[test]
     fn render_login_page_disable_default_css_removes_builtin_styles() {
         let css = "body { background: hotpink; }";
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", css, true, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", css, true, false, "").unwrap();
         assert!(!html.contains("box-sizing"));
         assert!(html.contains(css));
         assert_eq!(html.matches("<style>").count(), 1);
@@ -1592,7 +1826,7 @@ mod tests {
 
     #[test]
     fn render_login_page_keeps_builtin_styles_by_default() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false, "").unwrap();
         assert!(html.contains("box-sizing"));
     }
 
