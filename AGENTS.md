@@ -13,7 +13,7 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 1. Request arrives at hodor
 2. `/_gate/health` → bypass auth, return 200
 3. Password missing? → render the setup page via minijinja
-4. `/_gate/login` (POST) → if no password exists yet, validate + store it, set session cookie; otherwise rate-limit check → constant-time password compare → set session cookie
+4. `/_gate/login` (POST) → if no password exists yet, validate a deployment-provided bootstrap token + store the password, set session cookie; otherwise rate-limit check → constant-time password compare → set session cookie
 5. `/_gate/logout` → clear cookie, redirect
 6. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, render login page via minijinja
 
@@ -40,7 +40,7 @@ No database, no ORM, no framework magic.
 
 Layered: defaults → `hodor.toml` → environment variables. See README.md for the full table.
 
-Required: `password`/`PASSWORD`, `upstream`/`UPSTREAM`. Everything else has defaults.
+Required: `upstream`/`UPSTREAM`, plus either `password`/`PASSWORD` or `bootstrap_token`/`BOOTSTRAP_TOKEN` for first-run browser setup. Everything else has defaults.
 
 ## Build & Test
 

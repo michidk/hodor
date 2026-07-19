@@ -27,7 +27,8 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PASSWORD: "changeme"                          # optional; omit to bootstrap on first launch
+      PASSWORD: "changeme"                          # optional when using BOOTSTRAP_TOKEN for first-run setup
+      BOOTSTRAP_TOKEN: "setup-secret"              # required if PASSWORD is omitted
       UPSTREAM: "http://app:80"
       SECRET: "changeme"                              # signs session cookies (generate with: openssl rand -hex 32)
     depends_on:
@@ -57,7 +58,8 @@ Hodor uses layered configuration. Each layer overrides the previous:
 
 | Key | Env var | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `password` | `PASSWORD` | no | | The shared password. If omitted, hodor asks you to create one on first launch |
+| `password` | `PASSWORD` | no | | The shared password. Optional only when `BOOTSTRAP_TOKEN` is set for browser bootstrap |
+| `bootstrap_token` | `BOOTSTRAP_TOKEN` | no | | Deployment-provided one-time token required for first-run browser password setup |
 | `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`) |
 | `secret` | `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
@@ -77,8 +79,9 @@ Hodor uses layered configuration. Each layer overrides the previous:
 
 ```toml
 # hodor.toml
-# optional: omit this to set the password from the browser on first launch
+# optional when paired with bootstrap_token for first-run browser setup
 password = "changeme"
+bootstrap_token = "setup-secret"
 upstream = "http://app:3000"
 secret = "changeme" # generate with: openssl rand -hex 32
 title = "Restricted Area"
@@ -97,7 +100,7 @@ Request → hodor
   ├─ Has valid session cookie? → Reverse proxy to UPSTREAM
   └─ No cookie? → Show login page
        └─ POST /_gate/login
-            ├─ No password configured yet? → Set password, create session, redirect back
+            ├─ No password configured yet? → Validate bootstrap token, set password, create session, redirect back
             ├─ Rate limited or locked out? → 429 (with Retry-After)
             ├─ Password correct? → Set cookie, redirect back
             └─ Wrong? → Show login page with error (after a short delay)
@@ -254,7 +257,7 @@ The built-in template ([`src/template.html`](src/template.html)) is a good start
 
 ## Custom Setup Page
 
-First-run password bootstrap uses a separate template so existing login templates do not need to change. To customize the setup page, set `setup_template` / `SETUP_TEMPLATE` to an HTML file path.
+First-run password bootstrap uses a separate template so existing login templates do not need to change. To enable it safely, omit `PASSWORD` and set a deployment-provided `BOOTSTRAP_TOKEN`. To customize the setup page, set `setup_template` / `SETUP_TEMPLATE` to an HTML file path.
 
 ```yaml
 environment:
@@ -273,7 +276,7 @@ The setup template receives these variables:
 | `show_error` | bool | `true` when the setup form submission failed |
 | `error_message` | string | The setup error message to display |
 
-The built-in setup template lives at [`src/setup_template.html`](src/setup_template.html) and posts `password`, `password_confirm`, and `redirect` to `/_gate/login`.
+The built-in setup template lives at [`src/setup_template.html`](src/setup_template.html) and posts `bootstrap_token`, `password`, `password_confirm`, and `redirect` to `/_gate/login`.
 
 ## Custom Error Page
 
@@ -306,8 +309,8 @@ cargo build --release
 ```sh
 PASSWORD=secret UPSTREAM=http://localhost:3000 ./target/release/hodor
 
-# or omit PASSWORD and create it in the browser on first launch
-UPSTREAM=http://localhost:3000 ./target/release/hodor
+# or omit PASSWORD and bootstrap from the browser using a one-time token
+BOOTSTRAP_TOKEN=setup-secret UPSTREAM=http://localhost:3000 ./target/release/hodor
 ```
 
 ## Docker
@@ -318,8 +321,8 @@ Build locally:
 docker build -t hodor .
 docker run -e PASSWORD=secret -e UPSTREAM=http://host.docker.internal:3000 -p 8080:8080 hodor
 
-# or omit PASSWORD and create it in the browser on first launch
-docker run -e UPSTREAM=http://host.docker.internal:3000 -p 8080:8080 hodor
+# or omit PASSWORD and bootstrap from the browser using a one-time token
+docker run -e BOOTSTRAP_TOKEN=setup-secret -e UPSTREAM=http://host.docker.internal:3000 -p 8080:8080 hodor
 ```
 
 ### Health Checks
