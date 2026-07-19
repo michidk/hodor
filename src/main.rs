@@ -9,14 +9,13 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use minijinja::{Environment, context};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -751,7 +750,7 @@ fn load_secret(configured_secret: Option<&str>) -> Vec<u8> {
         Some(secret) => secret.as_bytes().to_vec(),
         None => {
             let mut secret = [0_u8; 32];
-            rand::thread_rng().fill_bytes(&mut secret);
+            rand::fill(&mut secret);
             warn!("SECRET not set, generated ephemeral signing key");
             secret.to_vec()
         }
