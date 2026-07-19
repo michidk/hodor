@@ -10,7 +10,7 @@ use axum::routing::get;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use hmac::{Hmac, KeyInit, Mac};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::signal::unix::{SignalKind, signal};
@@ -28,6 +28,21 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedProto {
+    Http,
+    Https,
+}
+
+impl ForwardedProto {
+    const fn as_header_value(self) -> HeaderValue {
+        match self {
+            Self::Http => HeaderValue::from_static("http"),
+            Self::Https => HeaderValue::from_static("https"),
+        }
+    }
+}
 
 const COOKIE_NAME: &str = "hodor";
 const BUILTIN_TEMPLATE: &str = include_str!("template.html");
@@ -38,6 +53,7 @@ const LOCKOUT_THRESHOLD: u32 = 10;
 const LOCKOUT_BASE: Duration = Duration::from_secs(60);
 const LOCKOUT_MAX: Duration = Duration::from_secs(3600);
 const FAILED_LOGIN_DELAY: Duration = Duration::from_millis(500);
+const MAX_LOGIN_BODY_SIZE: usize = 16 * 1024;
 const MAX_TRACKED_IPS: usize = 10_000;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_TEMPLATE_NAME: &str = "error.html";
@@ -79,6 +95,18 @@ impl LoginGuard {
         Self {
             records: HashMap::new(),
             last_pruned: now,
+        }
+    }
+}
+
+fn lock_login_guard(login_guard: &Mutex<LoginGuard>) -> MutexGuard<'_, LoginGuard> {
+    match login_guard.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("login guard lock was poisoned; recovering state");
+            let guard = poisoned.into_inner();
+            login_guard.clear_poison();
+            guard
         }
     }
 }
@@ -344,6 +372,7 @@ async fn proxy_request(
 
     let path = join_paths(&state.upstream_base_path, parts.uri.path());
     let uri = build_upstream_uri(&state, &path, parts.uri.query());
+    let forwarded_proto = resolve_forwarded_proto(&parts.headers, state.trust_proxy);
 
     let mut proxied = match Request::builder().method(parts.method).uri(uri).body(body) {
         Ok(request) => request,
@@ -353,7 +382,7 @@ async fn proxy_request(
     *proxied.version_mut() = parts.version;
 
     for (name, value) in &parts.headers {
-        if name != HOST && !is_hop_by_hop_header(name) {
+        if name != HOST && !is_hop_by_hop_header(&parts.headers, name) {
             proxied.headers_mut().append(name, value.clone());
         }
     }
@@ -365,7 +394,7 @@ async fn proxy_request(
         Err(_) => return bad_gateway(&state),
     }
 
-    append_forwarded_headers(proxied.headers_mut(), addr.ip());
+    append_forwarded_headers(proxied.headers_mut(), addr.ip(), forwarded_proto);
 
     let response = match state.client.request(proxied).await {
         Ok(response) => response,
@@ -378,7 +407,7 @@ async fn proxy_request(
     let mut builder = Response::builder().status(status);
     if let Some(headers) = builder.headers_mut() {
         for (name, value) in &parts.headers {
-            if !is_hop_by_hop_header(name) {
+            if !is_hop_by_hop_header(&parts.headers, name) {
                 headers.append(name, value.clone());
             }
         }
@@ -425,7 +454,25 @@ where
         .map_err(|error| error.to_string())?;
 
     apply_env_overrides(&mut config, pairs)?;
+    validate_config(&config)?;
     Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<(), String> {
+    if config.password.is_empty() {
+        return Err("PASSWORD is required and cannot be empty".to_string());
+    }
+    if config.upstream.is_empty() {
+        return Err("UPSTREAM is required and cannot be empty".to_string());
+    }
+    if config.secret.as_deref().is_some_and(str::is_empty) {
+        return Err("SECRET cannot be empty when configured".to_string());
+    }
+    if config.session_ttl == 0 {
+        return Err("SESSION_TTL must be greater than zero".to_string());
+    }
+
+    Ok(())
 }
 
 fn apply_env_overrides<I, K, V>(config: &mut Config, pairs: I) -> Result<(), String>
@@ -640,7 +687,7 @@ fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trust_proxy: bool) -> Ip
 // IP is currently locked out or has exhausted its rate-limit window.
 fn check_login_attempt(state: &AppState, ip: IpAddr) -> Option<Duration> {
     let now = Instant::now();
-    let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
+    let mut guard = lock_login_guard(&state.login_guard);
 
     if now.saturating_duration_since(guard.last_pruned) >= PRUNE_INTERVAL {
         prune_login_records(&mut guard.records, now);
@@ -679,7 +726,7 @@ fn check_login_attempt(state: &AppState, ip: IpAddr) -> Option<Duration> {
 // LOCKOUT_THRESHOLD consecutive failures.
 fn record_login_failure(state: &AppState, ip: IpAddr) -> Option<Duration> {
     let now = Instant::now();
-    let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
+    let mut guard = lock_login_guard(&state.login_guard);
 
     let record = guard
         .records
@@ -698,7 +745,7 @@ fn record_login_failure(state: &AppState, ip: IpAddr) -> Option<Duration> {
 }
 
 fn record_login_success(state: &AppState, ip: IpAddr) {
-    let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
+    let mut guard = lock_login_guard(&state.login_guard);
     guard.records.remove(&ip);
 }
 
@@ -753,7 +800,33 @@ fn clear_cookie(state: &AppState) -> String {
     cookie
 }
 
-fn append_forwarded_headers(headers: &mut HeaderMap, client_ip: IpAddr) {
+fn resolve_forwarded_proto(headers: &HeaderMap, trust_proxy: bool) -> ForwardedProto {
+    if !trust_proxy {
+        return ForwardedProto::Http;
+    }
+
+    let mut rightmost = None;
+    for value in headers.get_all(X_FORWARDED_PROTO_HEADER) {
+        let Ok(value) = value.to_str() else {
+            return ForwardedProto::Http;
+        };
+        for token in value.split(',') {
+            rightmost = Some(token.trim());
+        }
+    }
+
+    match rightmost {
+        Some(value) if value.eq_ignore_ascii_case("https") => ForwardedProto::Https,
+        Some(value) if value.eq_ignore_ascii_case("http") => ForwardedProto::Http,
+        _ => ForwardedProto::Http,
+    }
+}
+
+fn append_forwarded_headers(
+    headers: &mut HeaderMap,
+    client_ip: IpAddr,
+    forwarded_proto: ForwardedProto,
+) {
     let forwarded_for = match headers
         .get(HeaderName::from_static(X_FORWARDED_FOR_HEADER))
         .and_then(|value| value.to_str().ok())
@@ -767,7 +840,7 @@ fn append_forwarded_headers(headers: &mut HeaderMap, client_ip: IpAddr) {
     }
     headers.insert(
         HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
-        HeaderValue::from_static("http"),
+        forwarded_proto.as_header_value(),
     );
 }
 
@@ -911,8 +984,8 @@ fn sanitize_redirect(redirect: &str) -> String {
     }
 }
 
-fn is_hop_by_hop_header(name: &HeaderName) -> bool {
-    matches!(
+fn is_hop_by_hop_header(headers: &HeaderMap, name: &HeaderName) -> bool {
+    if matches!(
         name.as_str(),
         "connection"
             | "keep-alive"
@@ -922,7 +995,16 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-    )
+    ) {
+        return true;
+    }
+
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(name.as_str()))
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -952,8 +1034,11 @@ fn now_unix() -> u64 {
 }
 
 async fn collect_body(body: Body) -> Result<Bytes, Response<Body>> {
-    match body.collect().await {
+    match Limited::new(body, MAX_LOGIN_BODY_SIZE).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
+        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            Err((StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response())
+        }
         Err(_) => Err((StatusCode::BAD_REQUEST, "invalid request body").into_response()),
     }
 }
@@ -1141,6 +1226,28 @@ mod tests {
         assert!(form.is_empty());
     }
 
+    #[tokio::test]
+    async fn collect_body_rejects_oversized_login_form() {
+        let body = Body::from(vec![b'x'; MAX_LOGIN_BODY_SIZE + 1]);
+
+        let response = collect_body(body)
+            .await
+            .expect_err("oversized login form should be rejected");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn collect_body_accepts_login_form_at_limit() {
+        let body = Body::from(vec![b'x'; MAX_LOGIN_BODY_SIZE]);
+
+        let collected = collect_body(body)
+            .await
+            .expect("login form at size limit should be accepted");
+
+        assert_eq!(collected.len(), MAX_LOGIN_BODY_SIZE);
+    }
+
     #[test]
     fn form_value_missing_key() {
         let body = Bytes::from("a=1");
@@ -1234,17 +1341,50 @@ mod tests {
 
     #[test]
     fn is_hop_by_hop_header_detects_correctly() {
-        assert!(is_hop_by_hop_header(&HeaderName::from_static("connection")));
-        assert!(is_hop_by_hop_header(&HeaderName::from_static(
-            "transfer-encoding"
-        )));
-        assert!(is_hop_by_hop_header(&HeaderName::from_static("upgrade")));
-        assert!(!is_hop_by_hop_header(&HeaderName::from_static(
-            "content-type"
-        )));
-        assert!(!is_hop_by_hop_header(&HeaderName::from_static(
-            "authorization"
-        )));
+        let headers = HeaderMap::new();
+        assert!(is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("connection")
+        ));
+        assert!(is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("transfer-encoding")
+        ));
+        assert!(is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("upgrade")
+        ));
+        assert!(!is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("content-type")
+        ));
+        assert!(!is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("authorization")
+        ));
+    }
+
+    #[test]
+    fn is_hop_by_hop_header_detects_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            CONNECTION,
+            HeaderValue::from_static("keep-alive, X-Custom-Hop"),
+        );
+        headers.append(CONNECTION, HeaderValue::from_static("X-Second-Hop"));
+
+        assert!(is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("x-custom-hop")
+        ));
+        assert!(is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("x-second-hop")
+        ));
+        assert!(!is_hop_by_hop_header(
+            &headers,
+            &HeaderName::from_static("content-type")
+        ));
     }
 
     #[test]
@@ -1308,6 +1448,21 @@ mod tests {
         }
         assert!(check_login_attempt(&state, ip1).is_some());
         assert!(check_login_attempt(&state, ip2).is_none());
+    }
+
+    #[test]
+    fn check_login_attempt_recovers_from_poisoned_guard() {
+        let state = test_state(false);
+        let login_guard = Arc::clone(&state.login_guard);
+        let poisoned = std::panic::catch_unwind(move || {
+            let _guard = login_guard.lock().unwrap();
+            panic!("poison login guard for test");
+        });
+        assert!(poisoned.is_err());
+        let ip: IpAddr = "10.0.0.8".parse().unwrap();
+
+        assert!(check_login_attempt(&state, ip).is_none());
+        assert!(!state.login_guard.is_poisoned());
     }
 
     #[test]
@@ -1556,7 +1711,7 @@ mod tests {
     fn append_forwarded_headers_sets_headers() {
         let mut headers = HeaderMap::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        append_forwarded_headers(&mut headers, ip);
+        append_forwarded_headers(&mut headers, ip, ForwardedProto::Http);
         assert_eq!(
             headers
                 .get(X_FORWARDED_FOR_HEADER)
@@ -1583,7 +1738,7 @@ mod tests {
             HeaderValue::from_static("10.0.0.1"),
         );
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        append_forwarded_headers(&mut headers, ip);
+        append_forwarded_headers(&mut headers, ip, ForwardedProto::Http);
         assert_eq!(
             headers
                 .get(X_FORWARDED_FOR_HEADER)
@@ -1591,6 +1746,112 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "10.0.0.1, 192.168.1.1"
+        );
+    }
+
+    #[test]
+    fn append_forwarded_headers_preserves_proto_from_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https"),
+        );
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        append_forwarded_headers(&mut headers, ip, ForwardedProto::Https);
+
+        assert_eq!(headers.get(X_FORWARDED_PROTO_HEADER).unwrap(), "https");
+    }
+
+    #[test]
+    fn append_forwarded_headers_rejects_proto_from_untrusted_client() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https"),
+        );
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        append_forwarded_headers(&mut headers, ip, ForwardedProto::Http);
+
+        assert_eq!(headers.get(X_FORWARDED_PROTO_HEADER).unwrap(), "http");
+    }
+
+    #[test]
+    fn resolve_forwarded_proto_reads_connection_nominated_source_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONNECTION,
+            HeaderValue::from_static(X_FORWARDED_PROTO_HEADER),
+        );
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https"),
+        );
+
+        assert_eq!(
+            resolve_forwarded_proto(&headers, true),
+            ForwardedProto::Https
+        );
+    }
+
+    #[test]
+    fn resolve_forwarded_proto_uses_rightmost_trusted_value() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("http, https"),
+        );
+
+        assert_eq!(
+            resolve_forwarded_proto(&headers, true),
+            ForwardedProto::Https
+        );
+    }
+
+    #[test]
+    fn resolve_forwarded_proto_uses_rightmost_header_instance() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("http"),
+        );
+        headers.append(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https"),
+        );
+
+        assert_eq!(
+            resolve_forwarded_proto(&headers, true),
+            ForwardedProto::Https
+        );
+    }
+
+    #[test]
+    fn resolve_forwarded_proto_rejects_unrecognized_rightmost_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https, ftp"),
+        );
+
+        assert_eq!(
+            resolve_forwarded_proto(&headers, true),
+            ForwardedProto::Http
+        );
+    }
+
+    #[test]
+    fn resolve_forwarded_proto_ignores_untrusted_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https"),
+        );
+
+        assert_eq!(
+            resolve_forwarded_proto(&headers, false),
+            ForwardedProto::Http
         );
     }
 
@@ -1770,5 +2031,45 @@ mod tests {
         assert_eq!(config.session_ttl, 42);
         assert!(config.secure_cookie);
         assert!(config.trust_proxy);
+    }
+
+    #[test]
+    fn load_config_with_env_rejects_missing_password() {
+        let error = load_config_with_env([("UPSTREAM", "http://localhost:3000")])
+            .expect_err("missing PASSWORD should be rejected");
+
+        assert_eq!(error, "PASSWORD is required and cannot be empty");
+    }
+
+    #[test]
+    fn load_config_with_env_rejects_missing_upstream() {
+        let error = load_config_with_env([("PASSWORD", "hunter2")])
+            .expect_err("missing UPSTREAM should be rejected");
+
+        assert_eq!(error, "UPSTREAM is required and cannot be empty");
+    }
+
+    #[test]
+    fn load_config_with_env_rejects_empty_secret() {
+        let error = load_config_with_env([
+            ("PASSWORD", "hunter2"),
+            ("UPSTREAM", "http://localhost:3000"),
+            ("SECRET", ""),
+        ])
+        .expect_err("empty SECRET should be rejected");
+
+        assert_eq!(error, "SECRET cannot be empty when configured");
+    }
+
+    #[test]
+    fn load_config_with_env_rejects_zero_session_ttl() {
+        let error = load_config_with_env([
+            ("PASSWORD", "hunter2"),
+            ("UPSTREAM", "http://localhost:3000"),
+            ("SESSION_TTL", "0"),
+        ])
+        .expect_err("zero SESSION_TTL should be rejected");
+
+        assert_eq!(error, "SESSION_TTL must be greater than zero");
     }
 }
