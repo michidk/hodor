@@ -500,6 +500,11 @@ where
                     .parse::<u64>()
                     .map_err(|error| format!("SESSION_TTL must be a valid integer: {error}"))?;
             }
+            "DISABLE_DEFAULT_CSS" => {
+                config.disable_default_css = value.parse::<bool>().map_err(|error| {
+                    format!("DISABLE_DEFAULT_CSS must be true or false: {error}")
+                })?;
+            }
             "SECURE_COOKIE" => {
                 config.secure_cookie = value
                     .parse::<bool>()
@@ -2022,6 +2027,7 @@ mod tests {
             ("PASSWORD", "123"),
             ("UPSTREAM", "http://localhost:3000"),
             ("SESSION_TTL", "42"),
+            ("DISABLE_DEFAULT_CSS", "true"),
             ("SECURE_COOKIE", "true"),
             ("TRUST_PROXY", "true"),
         ])
@@ -2029,6 +2035,7 @@ mod tests {
 
         assert_eq!(config.password, "123");
         assert_eq!(config.session_ttl, 42);
+        assert!(config.disable_default_css);
         assert!(config.secure_cookie);
         assert!(config.trust_proxy);
     }
