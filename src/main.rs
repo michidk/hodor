@@ -60,6 +60,7 @@ struct AppState {
     upstream_base_path: String,
     session_ttl: Duration,
     secure_cookie: bool,
+    trust_proxy: bool,
     login_guard: Arc<Mutex<HashMap<IpAddr, LoginRecord>>>,
     client: Client<HttpConnector, Body>,
 }
@@ -109,6 +110,8 @@ struct Config {
     session_ttl: u64,
     #[serde(default)]
     secure_cookie: bool,
+    #[serde(default)]
+    trust_proxy: bool,
     #[serde(default = "default_log_format")]
     log_format: String,
 }
@@ -127,6 +130,7 @@ impl Default for Config {
             secret: None,
             session_ttl: default_session_ttl(),
             secure_cookie: false,
+            trust_proxy: false,
             log_format: default_log_format(),
         }
     }
@@ -185,6 +189,7 @@ async fn main() {
         upstream_base_path,
         session_ttl: Duration::from_secs(config.session_ttl),
         secure_cookie: config.secure_cookie,
+        trust_proxy: config.trust_proxy,
         login_guard: Arc::new(Mutex::new(HashMap::new())),
         client,
     };
@@ -198,6 +203,7 @@ async fn main() {
         disable_default_css = state.disable_default_css,
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
+        trust_proxy = state.trust_proxy,
         log_format = %config.log_format,
         "starting hodor"
     );
@@ -245,7 +251,7 @@ async fn login_post(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let client_ip = addr.ip();
+    let client_ip = resolve_client_ip(request.headers(), addr.ip(), state.trust_proxy);
 
     if let Some(retry_after) = check_login_attempt(&state, client_ip) {
         info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
@@ -533,6 +539,23 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+// With trust_proxy enabled, the rightmost X-Forwarded-For entry is the client
+// address as recorded by the trusted proxy directly in front of hodor (e.g. a
+// Kubernetes ingress). Left of that the header is client-controlled, so only
+// the rightmost entry is trusted. Falls back to the TCP peer address when the
+// header is missing or unparseable.
+fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trust_proxy: bool) -> IpAddr {
+    if !trust_proxy {
+        return peer;
+    }
+    headers
+        .get(HeaderName::from_static(X_FORWARDED_FOR_HEADER))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer)
 }
 
 // Returns None when the attempt may proceed, or Some(retry_after) when the
@@ -951,6 +974,7 @@ mod tests {
             upstream_base_path: String::new(),
             session_ttl: Duration::from_secs(3600),
             secure_cookie,
+            trust_proxy: false,
             login_guard: Arc::new(Mutex::new(HashMap::new())),
             client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
         }
@@ -1286,6 +1310,42 @@ mod tests {
         records.insert(recent_ip, LoginRecord::new(now));
         prune_login_records(&mut records, now + Duration::from_secs(1));
         assert!(records.contains_key(&recent_ip));
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_peer_when_proxy_not_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_FOR_HEADER),
+            HeaderValue::from_static("203.0.113.7"),
+        );
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(resolve_client_ip(&headers, peer, false), peer);
+    }
+
+    #[test]
+    fn resolve_client_ip_uses_rightmost_forwarded_entry() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_FOR_HEADER),
+            HeaderValue::from_static("198.51.100.9, 203.0.113.7"),
+        );
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let expected: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(resolve_client_ip(&headers, peer, true), expected);
+    }
+
+    #[test]
+    fn resolve_client_ip_falls_back_to_peer() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(resolve_client_ip(&HeaderMap::new(), peer, true), peer);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_FOR_HEADER),
+            HeaderValue::from_static("not-an-ip"),
+        );
+        assert_eq!(resolve_client_ip(&headers, peer, true), peer);
     }
 
     #[test]
