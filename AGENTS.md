@@ -12,17 +12,18 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 
 1. Request arrives at hodor
 2. `/_gate/health` → bypass auth, return 200
-3. `/_gate/login` (POST) → rate-limit check → constant-time password compare → set session cookie
-4. `/_gate/logout` → clear cookie, redirect
-5. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, render login page via minijinja
+3. Password missing? → render the setup page via minijinja
+4. `/_gate/login` (POST) → if no password exists yet, validate + store it, set session cookie; otherwise rate-limit check → constant-time password compare → set session cookie
+5. `/_gate/logout` → clear cookie, redirect
+6. All other paths → check session cookie → if valid, streaming reverse proxy to `UPSTREAM`; if not, render login page via minijinja
 
 ### Key Components
 
 - **Config**: loaded via figment (defaults → `hodor.toml` → env vars). Defined as a `Config` struct with serde.
-- **AppState**: shared runtime state (config-derived values, rate limiter, HTTP client)
+- **AppState**: shared runtime state (config-derived values, bootstrap-aware password state, rate limiter, HTTP client)
 - **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET
 - **Brute-force protection**: in-memory `HashMap<IpAddr, LoginRecord>` behind `Arc<Mutex<_>>` — sliding-window rate limit (5 attempts / 60s per IP), escalating lockouts after 10 consecutive failures (60s doubling per failure, capped at 1h), 500ms delay on failed attempts, `Retry-After` on 429s, capped at 10k tracked IPs with oldest-entry eviction. Client IP is the TCP peer address, or the rightmost `X-Forwarded-For` entry when `TRUST_PROXY=true`
-- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config; extra CSS via `CUSTOM_CSS` (injected after the built-in styles, unescaped); `DISABLE_DEFAULT_CSS` drops the built-in styles entirely. Login variables: `title`, `show_error`, `custom_css`, `disable_default_css`. Error variables: `title`, `status_code`, `heading`, `message`, `custom_css`, `disable_default_css`.
+- **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html`, setup template in `src/setup_template.html`, and error template in `src/error_template.html` (all embedded via `include_str!`). Custom templates via `TEMPLATE`/`SETUP_TEMPLATE`/`ERROR_TEMPLATE`; extra CSS via `CUSTOM_CSS` (injected after the built-in styles, unescaped); `DISABLE_DEFAULT_CSS` drops the built-in styles entirely. Login and setup variables: `title`, `show_error`, `error_message`, `custom_css`, `disable_default_css`. Error variables: `title`, `status_code`, `heading`, `message`, `custom_css`, `disable_default_css`.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 
 ### Dependencies

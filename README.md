@@ -27,7 +27,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PASSWORD: "changeme"                          # the login password
+      PASSWORD: "changeme"                          # optional; omit to bootstrap on first launch
       UPSTREAM: "http://app:80"
       SECRET: "changeme"                              # signs session cookies (generate with: openssl rand -hex 32)
     depends_on:
@@ -57,7 +57,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 
 | Key | Env var | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `password` | `PASSWORD` | yes | | The shared password |
+| `password` | `PASSWORD` | no | | The shared password. If omitted, hodor asks you to create one on first launch |
 | `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`) |
 | `secret` | `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
@@ -65,6 +65,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `custom_css` | `CUSTOM_CSS` | no | | Extra CSS injected after the built-in styles on the login and error pages |
 | `disable_default_css` | `DISABLE_DEFAULT_CSS` | no | `false` | Set `true` to drop the built-in styles entirely (style from scratch with `custom_css`) |
 | `template` | `TEMPLATE` | no | built-in | Path to a custom HTML login page template |
+| `setup_template` | `SETUP_TEMPLATE` | no | built-in | Path to a custom HTML first-run password setup template |
 | `error_template` | `ERROR_TEMPLATE` | no | built-in | Path to a custom HTML error page template |
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
 | `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
@@ -76,6 +77,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 
 ```toml
 # hodor.toml
+# optional: omit this to set the password from the browser on first launch
 password = "changeme"
 upstream = "http://app:3000"
 secret = "changeme" # generate with: openssl rand -hex 32
@@ -91,9 +93,11 @@ Environment variables always win. Set `PASSWORD=override` and it takes precedenc
 ```
 Request → hodor
   ├─ /_gate/health → 200 ok (bypass auth)
+  ├─ Password missing? → Show first-run setup page
   ├─ Has valid session cookie? → Reverse proxy to UPSTREAM
   └─ No cookie? → Show login page
        └─ POST /_gate/login
+            ├─ No password configured yet? → Set password, create session, redirect back
             ├─ Rate limited or locked out? → 429 (with Retry-After)
             ├─ Password correct? → Set cookie, redirect back
             └─ Wrong? → Show login page with error (after a short delay)
@@ -170,9 +174,10 @@ Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinj
 | Variable | Type | Description |
 | --- | --- | --- |
 | `title` | string | The configured title (auto-escaped) |
-| `show_error` | bool | `true` when the user entered a wrong password |
+| `show_error` | bool | `true` when the current form submission failed |
 | `custom_css` | string | The configured `custom_css` — include it with `{{ custom_css \| safe }}` to keep the override working in your template |
 | `disable_default_css` | bool | `true` when `disable_default_css` is set — custom templates can use it to gate their own base styles |
+| `error_message` | string | The message to show when `show_error` is true |
 
 ### Template Example
 
@@ -226,7 +231,7 @@ The built-in template ([`src/template.html`](src/template.html)) is a good start
 <body>
   <main class="card">
     <h1>{{ title }}</h1>
-    <div class="error">Wrong password.</div>
+    <div class="error">{{ error_message }}</div>
     <form method="post" action="/_gate/login">
       <input type="hidden" name="redirect" value="/">
       <input name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus required>
@@ -246,6 +251,29 @@ The built-in template ([`src/template.html`](src/template.html)) is a good start
 1. The form **must** POST to `/_gate/login` with a `password` field
 2. Include a `redirect` hidden field (populated via JS) so users return to the page they were trying to access
 3. Use `{% if show_error %}` to conditionally show error messages
+
+## Custom Setup Page
+
+First-run password bootstrap uses a separate template so existing login templates do not need to change. To customize the setup page, set `setup_template` / `SETUP_TEMPLATE` to an HTML file path.
+
+```yaml
+environment:
+  SETUP_TEMPLATE: /etc/hodor/setup.html
+volumes:
+  - ./my-setup.html:/etc/hodor/setup.html:ro
+```
+
+The setup template receives these variables:
+
+| Variable | Type | Description |
+| --- | --- | --- |
+| `title` | string | The configured title (auto-escaped) |
+| `custom_css` | string | The configured `custom_css` — include it with `{{ custom_css \| safe }}` to keep the override working in your template |
+| `disable_default_css` | bool | `true` when `disable_default_css` is set — custom templates can use it to gate their own base styles |
+| `show_error` | bool | `true` when the setup form submission failed |
+| `error_message` | string | The setup error message to display |
+
+The built-in setup template lives at [`src/setup_template.html`](src/setup_template.html) and posts `password`, `password_confirm`, and `redirect` to `/_gate/login`.
 
 ## Custom Error Page
 
@@ -277,6 +305,9 @@ cargo build --release
 
 ```sh
 PASSWORD=secret UPSTREAM=http://localhost:3000 ./target/release/hodor
+
+# or omit PASSWORD and create it in the browser on first launch
+UPSTREAM=http://localhost:3000 ./target/release/hodor
 ```
 
 ## Docker
@@ -286,6 +317,9 @@ Build locally:
 ```sh
 docker build -t hodor .
 docker run -e PASSWORD=secret -e UPSTREAM=http://host.docker.internal:3000 -p 8080:8080 hodor
+
+# or omit PASSWORD and create it in the browser on first launch
+docker run -e UPSTREAM=http://host.docker.internal:3000 -p 8080:8080 hodor
 ```
 
 ### Health Checks
