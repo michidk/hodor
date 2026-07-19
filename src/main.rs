@@ -1,5 +1,5 @@
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{
     CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, SET_COOKIE, UPGRADE,
@@ -10,7 +10,6 @@ use axum::routing::get;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use hmac::{Hmac, KeyInit, Mac};
-use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -41,6 +40,7 @@ const LOCKOUT_MAX: Duration = Duration::from_secs(3600);
 const FAILED_LOGIN_DELAY: Duration = Duration::from_millis(500);
 const MAX_TRACKED_IPS: usize = 10_000;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_FORM_BODY_BYTES: usize = 8 * 1024;
 const ERROR_TEMPLATE_NAME: &str = "error.html";
 const TEMPLATE_NAME: &str = "login.html";
 const SETUP_TEMPLATE_NAME: &str = "setup.html";
@@ -50,6 +50,7 @@ const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 #[derive(Clone)]
 struct AppState {
     password: Arc<Mutex<Option<Vec<u8>>>>,
+    bootstrap_token: Arc<Mutex<Option<Vec<u8>>>>,
     title: String,
     custom_css: String,
     disable_default_css: bool,
@@ -113,6 +114,8 @@ impl LoginRecord {
 struct Config {
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    bootstrap_token: Option<String>,
     upstream: String,
     #[serde(default = "default_listen")]
     listen: String,
@@ -144,6 +147,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             password: None,
+            bootstrap_token: None,
             upstream: String::new(),
             listen: default_listen(),
             title: default_title(),
@@ -210,6 +214,10 @@ async fn main() {
         .password
         .as_deref()
         .is_some_and(|password| !password.is_empty());
+    let bootstrap_token_configured = config
+        .bootstrap_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty());
 
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
@@ -217,6 +225,12 @@ async fn main() {
             config
                 .password
                 .filter(|password| !password.is_empty())
+                .map(String::into_bytes),
+        )),
+        bootstrap_token: Arc::new(Mutex::new(
+            config
+                .bootstrap_token
+                .filter(|token| !token.is_empty())
                 .map(String::into_bytes),
         )),
         title: config.title,
@@ -246,6 +260,7 @@ async fn main() {
         custom_css_set = !state.custom_css.is_empty(),
         disable_default_css = state.disable_default_css,
         password_configured,
+        bootstrap_token_configured,
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
         trust_proxy = state.trust_proxy,
@@ -298,7 +313,16 @@ async fn login_post(
 ) -> Response<Body> {
     let client_ip = resolve_client_ip(request.headers(), addr.ip(), state.trust_proxy);
 
-    let body = match collect_body(request.into_body()).await {
+    if password_is_configured(&state) {
+        if let Some(retry_after) = check_login_attempt(&state, client_ip) {
+            info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
+            return too_many_requests(retry_after);
+        }
+    } else if !bootstrap_is_enabled(&state) {
+        return bootstrap_not_enabled_response(&state);
+    }
+
+    let body = match collect_limited_body(request.into_body(), MAX_FORM_BODY_BYTES).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -307,6 +331,7 @@ async fn login_post(
     let redirect = sanitize_redirect(form_value(&form, "redirect").unwrap_or("/"));
     let password = form_value(&form, "password").unwrap_or("");
     let password_confirm = form_value(&form, "password_confirm").unwrap_or("");
+    let bootstrap_token = form_value(&form, "bootstrap_token").unwrap_or("");
 
     if !password_is_configured(&state) {
         if password.is_empty() {
@@ -319,15 +344,13 @@ async fn login_post(
             return setup_page_response(&state, true, "Passwords do not match.");
         }
 
-        if set_password_if_missing(&state, password) {
+        if bootstrap_password_if_missing(&state, bootstrap_token, password) {
             info!(client_ip = %client_ip, success = true, setup = true, "login attempt");
             return authenticated_response(&state, &redirect);
         }
-    }
 
-    if let Some(retry_after) = check_login_attempt(&state, client_ip) {
-        info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
-        return too_many_requests(retry_after);
+        info!(client_ip = %client_ip, success = false, setup = true, reason = "invalid_bootstrap_token", "login attempt");
+        return setup_page_response(&state, true, "Bootstrap token is invalid.");
     }
 
     let Some(configured_password) = configured_password(&state) else {
@@ -354,6 +377,9 @@ async fn proxy_or_login(
     request: Request<Body>,
 ) -> Response<Body> {
     if !password_is_configured(&state) {
+        if !bootstrap_is_enabled(&state) {
+            return bootstrap_not_enabled_response(&state);
+        }
         return setup_page_response(&state, false, "");
     }
 
@@ -474,6 +500,26 @@ fn load_error_template(template_path: Option<&str>) -> String {
             .expect("failed to read custom error template from ERROR_TEMPLATE path"),
         None => BUILTIN_ERROR_TEMPLATE.to_string(),
     }
+}
+
+fn bootstrap_is_enabled(state: &AppState) -> bool {
+    state
+        .bootstrap_token
+        .lock()
+        .expect("bootstrap token lock poisoned")
+        .is_some()
+}
+
+#[cfg(test)]
+fn bootstrap_token_matches(state: &AppState, candidate: &str) -> bool {
+    let guard = state
+        .bootstrap_token
+        .lock()
+        .expect("bootstrap token lock poisoned");
+    let Some(expected) = guard.as_deref() else {
+        return false;
+    };
+    bool::from(candidate.as_bytes().ct_eq(expected))
 }
 
 fn validate_template(
@@ -621,6 +667,15 @@ fn setup_page_response(state: &AppState, show_error: bool, error_message: &str) 
     }
 }
 
+fn bootstrap_not_enabled_response(state: &AppState) -> Response<Body> {
+    error_page_response(
+        state,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Password Setup Not Enabled",
+        "This instance has no PASSWORD configured yet. Set PASSWORD for an immediate login credential, or set BOOTSTRAP_TOKEN to enable first-run browser setup.",
+    )
+}
+
 fn configured_password(state: &AppState) -> Option<Vec<u8>> {
     state
         .password
@@ -637,13 +692,26 @@ fn password_is_configured(state: &AppState) -> bool {
         .is_some()
 }
 
-fn set_password_if_missing(state: &AppState, password: &str) -> bool {
+fn bootstrap_password_if_missing(state: &AppState, bootstrap_token: &str, password: &str) -> bool {
     let mut configured_password = state.password.lock().expect("password lock poisoned");
     if configured_password.is_some() {
         return false;
     }
 
+    let mut configured_bootstrap_token = state
+        .bootstrap_token
+        .lock()
+        .expect("bootstrap token lock poisoned");
+    let Some(expected_token) = configured_bootstrap_token.as_deref() else {
+        return false;
+    };
+
+    if !bool::from(bootstrap_token.as_bytes().ct_eq(expected_token)) {
+        return false;
+    }
+
     *configured_password = Some(password.as_bytes().to_vec());
+    configured_bootstrap_token.take();
     true
 }
 
@@ -1038,10 +1106,10 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-async fn collect_body(body: Body) -> Result<Bytes, Response<Body>> {
-    match body.collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(_) => Err((StatusCode::BAD_REQUEST, "invalid request body").into_response()),
+async fn collect_limited_body(body: Body, limit: usize) -> Result<Bytes, Response<Body>> {
+    match to_bytes(body, limit).await {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Err((StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()),
     }
 }
 
@@ -1137,6 +1205,7 @@ mod tests {
     fn test_state(secure_cookie: bool) -> AppState {
         AppState {
             password: Arc::new(Mutex::new(Some(b"hunter2".to_vec()))),
+            bootstrap_token: Arc::new(Mutex::new(Some(b"bootstrap-secret".to_vec()))),
             title: "Test".to_string(),
             custom_css: String::new(),
             disable_default_css: false,
@@ -1159,6 +1228,7 @@ mod tests {
     fn test_state_without_password() -> AppState {
         AppState {
             password: Arc::new(Mutex::new(None)),
+            bootstrap_token: Arc::new(Mutex::new(Some(b"bootstrap-secret".to_vec()))),
             title: "Test".to_string(),
             custom_css: String::new(),
             disable_default_css: false,
@@ -1606,10 +1676,43 @@ mod tests {
     fn password_helpers_track_bootstrap_state() {
         let state = test_state_without_password();
         assert!(!password_is_configured(&state));
-        assert!(set_password_if_missing(&state, "new-password"));
+        assert!(bootstrap_password_if_missing(
+            &state,
+            "bootstrap-secret",
+            "new-password"
+        ));
         assert!(password_is_configured(&state));
         assert_eq!(configured_password(&state), Some(b"new-password".to_vec()));
-        assert!(!set_password_if_missing(&state, "other-password"));
+        assert!(!bootstrap_password_if_missing(
+            &state,
+            "bootstrap-secret",
+            "other-password"
+        ));
+    }
+
+    #[test]
+    fn bootstrap_token_helper_requires_matching_secret() {
+        let state = test_state_without_password();
+        assert!(bootstrap_is_enabled(&state));
+        assert!(bootstrap_token_matches(&state, "bootstrap-secret"));
+        assert!(!bootstrap_token_matches(&state, "wrong-secret"));
+        assert!(!bootstrap_token_matches(&state, ""));
+    }
+
+    #[test]
+    fn bootstrap_password_consumes_token_after_success() {
+        let state = test_state_without_password();
+        assert!(bootstrap_password_if_missing(
+            &state,
+            "bootstrap-secret",
+            "new-password"
+        ));
+        assert!(!bootstrap_is_enabled(&state));
+        assert!(!bootstrap_password_if_missing(
+            &state,
+            "bootstrap-secret",
+            "other-password"
+        ));
     }
 
     #[test]

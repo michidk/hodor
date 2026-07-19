@@ -82,6 +82,8 @@
     <div class="error">{{ error_message }}</div>
     <form method="post" action="/_gate/login">
       <input type="hidden" name="redirect" value="/">
+      <label for="bootstrap_token">Bootstrap token</label>
+      <input id="bootstrap_token" name="bootstrap_token" type="password" autocomplete="one-time-code" required>
       <label for="password">Password</label>
       <input id="password" name="password" type="password" autocomplete="new-password" autofocus required>
       <label for="password_confirm">Confirm password</label>
