@@ -21,7 +21,7 @@ Single-binary HTTP server built on axum + hyper. Everything lives in `src/main.r
 - **Config**: loaded via figment (defaults → `hodor.toml` → env vars). Defined as a `Config` struct with serde.
 - **AppState**: shared runtime state (config-derived values, rate limiter, HTTP client)
 - **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET
-- **Rate limiter**: in-memory `HashMap<IpAddr, Vec<Instant>>` behind `Arc<Mutex<_>>`, 5 attempts per 60s per IP
+- **Brute-force protection**: in-memory `HashMap<IpAddr, LoginRecord>` behind `Arc<Mutex<_>>` — sliding-window rate limit (5 attempts / 60s per IP), escalating lockouts after 10 consecutive failures (60s doubling per failure, capped at 1h), 500ms delay on failed attempts, `Retry-After` on 429s, capped at 10k tracked IPs with oldest-entry eviction
 - **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config; extra CSS via `CUSTOM_CSS` (injected after the built-in styles, unescaped); `DISABLE_DEFAULT_CSS` drops the built-in styles entirely. Login variables: `title`, `show_error`, `custom_css`, `disable_default_css`. Error variables: `title`, `status_code`, `heading`, `message`, `custom_css`, `disable_default_css`.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 

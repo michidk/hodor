@@ -10,7 +10,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - HMAC-SHA256 signed session cookies
 - Streaming reverse proxy (handles large uploads/downloads without buffering)
 - Constant-time password comparison
-- Per-IP rate limiting on login (5 attempts / 60s)
+- Brute-force protection: per-IP rate limiting (5 attempts / 60s), escalating lockouts after repeated failures, and delayed responses to failed logins
 - Structured tracing output (compact or JSON)
 - Health check endpoint for container orchestrators
 - Graceful shutdown on SIGTERM
@@ -93,10 +93,23 @@ Request → hodor
   ├─ Has valid session cookie? → Reverse proxy to UPSTREAM
   └─ No cookie? → Show login page
        └─ POST /_gate/login
-            ├─ Rate limited? → 429
+            ├─ Rate limited or locked out? → 429 (with Retry-After)
             ├─ Password correct? → Set cookie, redirect back
-            └─ Wrong? → Show login page with error
+            └─ Wrong? → Show login page with error (after a short delay)
 ```
+
+### Brute-Force Protection
+
+Login attempts are guarded per client IP, entirely in memory:
+
+- **Rate limiting** — at most 5 attempts per 60 seconds per IP.
+- **Escalating lockouts** — after 10 consecutive failed attempts, the IP is locked out for 60 seconds; each further failure doubles the lockout, up to 1 hour.
+- **Failure delay** — every failed attempt is answered after a 500ms delay to slow down online guessing.
+- **`Retry-After`** — rate-limited and locked-out responses return `429` with a `Retry-After` header.
+
+A successful login clears the IP's failure history. State is in-memory (capped at 10,000 tracked IPs), so it resets on restart.
+
+Note: hodor uses the TCP peer address as the client IP. If you run hodor behind another reverse proxy, all clients share that proxy's IP for rate-limiting purposes.
 
 ### Reserved Paths
 

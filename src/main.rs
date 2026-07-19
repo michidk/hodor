@@ -2,7 +2,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{
-    CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, UPGRADE,
+    CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, SET_COOKIE, UPGRADE,
 };
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Redirect};
@@ -35,6 +35,11 @@ const BUILTIN_TEMPLATE: &str = include_str!("template.html");
 const BUILTIN_ERROR_TEMPLATE: &str = include_str!("error_template.html");
 const RATE_LIMIT_ATTEMPTS: usize = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const LOCKOUT_THRESHOLD: u32 = 10;
+const LOCKOUT_BASE: Duration = Duration::from_secs(60);
+const LOCKOUT_MAX: Duration = Duration::from_secs(3600);
+const FAILED_LOGIN_DELAY: Duration = Duration::from_millis(500);
+const MAX_TRACKED_IPS: usize = 10_000;
 const ERROR_TEMPLATE_NAME: &str = "error.html";
 const TEMPLATE_NAME: &str = "login.html";
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
@@ -55,8 +60,31 @@ struct AppState {
     upstream_base_path: String,
     session_ttl: Duration,
     secure_cookie: bool,
-    rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
+    login_guard: Arc<Mutex<HashMap<IpAddr, LoginRecord>>>,
     client: Client<HttpConnector, Body>,
+}
+
+// Brute-force protection state per client IP. A sliding window throttles
+// bursts; consecutive failures past LOCKOUT_THRESHOLD trigger lockouts that
+// double per failure (capped at LOCKOUT_MAX). A successful login clears the
+// record.
+#[derive(Debug, Clone)]
+struct LoginRecord {
+    attempts: Vec<Instant>,
+    consecutive_failures: u32,
+    locked_until: Option<Instant>,
+    last_seen: Instant,
+}
+
+impl LoginRecord {
+    fn new(now: Instant) -> Self {
+        Self {
+            attempts: Vec::new(),
+            consecutive_failures: 0,
+            locked_until: None,
+            last_seen: now,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -157,7 +185,7 @@ async fn main() {
         upstream_base_path,
         session_ttl: Duration::from_secs(config.session_ttl),
         secure_cookie: config.secure_cookie,
-        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        login_guard: Arc::new(Mutex::new(HashMap::new())),
         client,
     };
 
@@ -219,9 +247,9 @@ async fn login_post(
 ) -> Response<Body> {
     let client_ip = addr.ip();
 
-    if !allow_login_attempt(&state, client_ip) {
+    if let Some(retry_after) = check_login_attempt(&state, client_ip) {
         info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
-        return (StatusCode::TOO_MANY_REQUESTS, "too many login attempts").into_response();
+        return too_many_requests(retry_after);
     }
 
     let body = match collect_body(request.into_body()).await {
@@ -234,9 +262,15 @@ async fn login_post(
     let password = form_value(&form, "password").unwrap_or("");
 
     if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
+        if let Some(lockout) = record_login_failure(&state, client_ip) {
+            warn!(client_ip = %client_ip, lockout_secs = lockout.as_secs(), "locking out ip after repeated failed logins");
+        }
         info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
+        tokio::time::sleep(FAILED_LOGIN_DELAY).await;
         return login_page_response(&state, true);
     }
+
+    record_login_success(&state, client_ip);
 
     let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
     let cookie = session_cookie(&state, &token);
@@ -501,26 +535,92 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     None
 }
 
-fn allow_login_attempt(state: &AppState, ip: IpAddr) -> bool {
+// Returns None when the attempt may proceed, or Some(retry_after) when the
+// IP is currently locked out or has exhausted its rate-limit window.
+fn check_login_attempt(state: &AppState, ip: IpAddr) -> Option<Duration> {
     let now = Instant::now();
-    let cutoff = now.checked_sub(RATE_LIMIT_WINDOW).unwrap_or(now);
-    let mut limiter = state
-        .rate_limiter
-        .lock()
-        .expect("rate limiter lock poisoned");
+    let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
 
-    limiter.retain(|_, attempts| {
-        attempts.retain(|attempt| *attempt >= cutoff);
-        !attempts.is_empty()
-    });
-
-    let attempts = limiter.entry(ip).or_default();
-    if attempts.len() >= RATE_LIMIT_ATTEMPTS {
-        return false;
+    prune_login_records(&mut guard, now);
+    if !guard.contains_key(&ip) && guard.len() >= MAX_TRACKED_IPS {
+        evict_oldest_record(&mut guard);
     }
 
-    attempts.push(now);
-    true
+    let record = guard.entry(ip).or_insert_with(|| LoginRecord::new(now));
+    record.last_seen = now;
+
+    if let Some(locked_until) = record.locked_until {
+        if locked_until > now {
+            return Some(locked_until - now);
+        }
+        record.locked_until = None;
+    }
+
+    let cutoff = now.checked_sub(RATE_LIMIT_WINDOW).unwrap_or(now);
+    record.attempts.retain(|attempt| *attempt >= cutoff);
+    if record.attempts.len() >= RATE_LIMIT_ATTEMPTS {
+        let oldest = record.attempts.iter().min().copied().unwrap_or(now);
+        let retry_after = (oldest + RATE_LIMIT_WINDOW).saturating_duration_since(now);
+        return Some(retry_after.max(Duration::from_secs(1)));
+    }
+
+    record.attempts.push(now);
+    None
+}
+
+// Returns the lockout duration when this failure pushes the IP past
+// LOCKOUT_THRESHOLD consecutive failures.
+fn record_login_failure(state: &AppState, ip: IpAddr) -> Option<Duration> {
+    let now = Instant::now();
+    let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
+
+    let record = guard.entry(ip).or_insert_with(|| LoginRecord::new(now));
+    record.last_seen = now;
+    record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+
+    if record.consecutive_failures < LOCKOUT_THRESHOLD {
+        return None;
+    }
+
+    let lockout = lockout_duration(record.consecutive_failures - LOCKOUT_THRESHOLD);
+    record.locked_until = Some(now + lockout);
+    Some(lockout)
+}
+
+fn record_login_success(state: &AppState, ip: IpAddr) {
+    let mut guard = state.login_guard.lock().expect("login guard lock poisoned");
+    guard.remove(&ip);
+}
+
+fn lockout_duration(exponent: u32) -> Duration {
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    LOCKOUT_BASE.saturating_mul(multiplier).min(LOCKOUT_MAX)
+}
+
+fn prune_login_records(records: &mut HashMap<IpAddr, LoginRecord>, now: Instant) {
+    records.retain(|_, record| {
+        let locked = record.locked_until.is_some_and(|until| until > now);
+        locked || now.saturating_duration_since(record.last_seen) < LOCKOUT_MAX
+    });
+}
+
+fn evict_oldest_record(records: &mut HashMap<IpAddr, LoginRecord>) {
+    let oldest = records
+        .iter()
+        .min_by_key(|(_, record)| record.last_seen)
+        .map(|(ip, _)| *ip);
+    if let Some(ip) = oldest {
+        records.remove(&ip);
+    }
+}
+
+fn too_many_requests(retry_after: Duration) -> Response<Body> {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, "too many login attempts").into_response();
+    let seconds = retry_after.as_secs().max(1);
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+        response.headers_mut().insert(RETRY_AFTER, value);
+    }
+    response
 }
 
 fn session_cookie(state: &AppState, token: &str) -> String {
@@ -851,7 +951,7 @@ mod tests {
             upstream_base_path: String::new(),
             session_ttl: Duration::from_secs(3600),
             secure_cookie,
-            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            login_guard: Arc::new(Mutex::new(HashMap::new())),
             client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
         }
     }
@@ -1067,34 +1167,151 @@ mod tests {
     }
 
     #[test]
-    fn allow_login_attempt_permits_first_attempts() {
+    fn check_login_attempt_permits_first_attempts() {
         let state = test_state(false);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..RATE_LIMIT_ATTEMPTS {
-            assert!(allow_login_attempt(&state, ip));
+            assert!(check_login_attempt(&state, ip).is_none());
         }
     }
 
     #[test]
-    fn allow_login_attempt_blocks_after_limit() {
+    fn check_login_attempt_blocks_after_limit_with_retry_after() {
         let state = test_state(false);
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
         for _ in 0..RATE_LIMIT_ATTEMPTS {
-            allow_login_attempt(&state, ip);
+            check_login_attempt(&state, ip);
         }
-        assert!(!allow_login_attempt(&state, ip));
+        let retry_after = check_login_attempt(&state, ip).expect("should be rate limited");
+        assert!(retry_after <= RATE_LIMIT_WINDOW);
+        assert!(retry_after >= Duration::from_secs(1));
     }
 
     #[test]
-    fn allow_login_attempt_isolates_ips() {
+    fn check_login_attempt_isolates_ips() {
         let state = test_state(false);
         let ip1: IpAddr = "10.0.0.3".parse().unwrap();
         let ip2: IpAddr = "10.0.0.4".parse().unwrap();
         for _ in 0..RATE_LIMIT_ATTEMPTS {
-            allow_login_attempt(&state, ip1);
+            check_login_attempt(&state, ip1);
         }
-        assert!(!allow_login_attempt(&state, ip1));
-        assert!(allow_login_attempt(&state, ip2));
+        assert!(check_login_attempt(&state, ip1).is_some());
+        assert!(check_login_attempt(&state, ip2).is_none());
+    }
+
+    #[test]
+    fn record_login_failure_locks_out_after_threshold() {
+        let state = test_state(false);
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        for _ in 0..LOCKOUT_THRESHOLD - 1 {
+            assert!(record_login_failure(&state, ip).is_none());
+        }
+        let lockout = record_login_failure(&state, ip).expect("should trigger lockout");
+        assert_eq!(lockout, LOCKOUT_BASE);
+        let retry_after = check_login_attempt(&state, ip).expect("should be locked out");
+        assert!(retry_after <= LOCKOUT_BASE);
+    }
+
+    #[test]
+    fn record_login_failure_escalates_lockouts() {
+        let state = test_state(false);
+        let ip: IpAddr = "10.0.0.6".parse().unwrap();
+        for _ in 0..LOCKOUT_THRESHOLD {
+            record_login_failure(&state, ip);
+        }
+        let second = record_login_failure(&state, ip).expect("should stay locked out");
+        assert_eq!(second, LOCKOUT_BASE * 2);
+        let third = record_login_failure(&state, ip).expect("should stay locked out");
+        assert_eq!(third, LOCKOUT_BASE * 4);
+    }
+
+    #[test]
+    fn record_login_success_clears_record() {
+        let state = test_state(false);
+        let ip: IpAddr = "10.0.0.7".parse().unwrap();
+        for _ in 0..RATE_LIMIT_ATTEMPTS {
+            check_login_attempt(&state, ip);
+        }
+        for _ in 0..LOCKOUT_THRESHOLD {
+            record_login_failure(&state, ip);
+        }
+        assert!(check_login_attempt(&state, ip).is_some());
+        record_login_success(&state, ip);
+        assert!(check_login_attempt(&state, ip).is_none());
+    }
+
+    #[test]
+    fn lockout_duration_caps_at_max() {
+        assert_eq!(lockout_duration(0), LOCKOUT_BASE);
+        assert_eq!(lockout_duration(1), LOCKOUT_BASE * 2);
+        assert_eq!(lockout_duration(10), LOCKOUT_MAX);
+        assert_eq!(lockout_duration(u32::MAX), LOCKOUT_MAX);
+    }
+
+    #[test]
+    fn login_guard_evicts_oldest_when_full() {
+        let state = test_state(false);
+        for index in 0..MAX_TRACKED_IPS {
+            let ip = IpAddr::from(u32::try_from(index).unwrap().to_be_bytes());
+            check_login_attempt(&state, ip);
+        }
+        {
+            let guard = state.login_guard.lock().unwrap();
+            assert_eq!(guard.len(), MAX_TRACKED_IPS);
+        }
+        let newcomer: IpAddr = "203.0.113.1".parse().unwrap();
+        assert!(check_login_attempt(&state, newcomer).is_none());
+        let guard = state.login_guard.lock().unwrap();
+        assert_eq!(guard.len(), MAX_TRACKED_IPS);
+        assert!(guard.contains_key(&newcomer));
+    }
+
+    #[test]
+    fn prune_login_records_keeps_locked_and_recent() {
+        let now = Instant::now();
+        let mut records: HashMap<IpAddr, LoginRecord> = HashMap::new();
+
+        let locked_ip: IpAddr = "10.1.0.1".parse().unwrap();
+        let mut locked = LoginRecord::new(now);
+        locked.locked_until = Some(now + Duration::from_secs(30));
+        records.insert(locked_ip, locked);
+
+        let recent_ip: IpAddr = "10.1.0.2".parse().unwrap();
+        records.insert(recent_ip, LoginRecord::new(now));
+
+        prune_login_records(&mut records, now + LOCKOUT_MAX + Duration::from_secs(1));
+        assert!(!records.contains_key(&locked_ip));
+        assert!(!records.contains_key(&recent_ip));
+
+        records.insert(recent_ip, LoginRecord::new(now));
+        prune_login_records(&mut records, now + Duration::from_secs(1));
+        assert!(records.contains_key(&recent_ip));
+    }
+
+    #[test]
+    fn too_many_requests_sets_retry_after_header() {
+        let response = too_many_requests(Duration::from_secs(42));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "42"
+        );
+
+        let response = too_many_requests(Duration::from_millis(10));
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "1"
+        );
     }
 
     #[test]
