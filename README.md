@@ -10,7 +10,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - HMAC-SHA256 signed session cookies
 - Streaming reverse proxy (handles large uploads/downloads without buffering)
 - Constant-time password comparison
-- Per-IP rate limiting on login (5 attempts / 60s)
+- Brute-force protection: per-IP rate limiting (5 attempts / 60s), escalating lockouts after repeated failures, and delayed responses to failed logins
 - Structured tracing output (compact or JSON)
 - Health check endpoint for container orchestrators
 - Graceful shutdown on SIGTERM
@@ -68,6 +68,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `error_template` | `ERROR_TEMPLATE` | no | built-in | Path to a custom HTML error page template |
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
 | `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
+| `trust_proxy` | `TRUST_PROXY` | no | `false` | Set `true` when hodor runs directly behind a trusted reverse proxy (e.g. a Kubernetes ingress) to rate-limit by the client IP from `X-Forwarded-For` instead of the TCP peer address |
 | `log_format` | `LOG_FORMAT` | no | `compact` | Tracing output format: `compact` or `json` |
 | — | `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
 
@@ -93,10 +94,23 @@ Request → hodor
   ├─ Has valid session cookie? → Reverse proxy to UPSTREAM
   └─ No cookie? → Show login page
        └─ POST /_gate/login
-            ├─ Rate limited? → 429
+            ├─ Rate limited or locked out? → 429 (with Retry-After)
             ├─ Password correct? → Set cookie, redirect back
-            └─ Wrong? → Show login page with error
+            └─ Wrong? → Show login page with error (after a short delay)
 ```
+
+### Brute-Force Protection
+
+Login attempts are guarded per client IP, entirely in memory:
+
+- **Rate limiting** — at most 5 attempts per 60 seconds per IP.
+- **Escalating lockouts** — after 10 consecutive failed attempts, the IP is locked out for 60 seconds; each further failure doubles the lockout, up to 1 hour.
+- **Failure delay** — every failed attempt is answered after a 500ms delay to slow down online guessing.
+- **`Retry-After`** — rate-limited and locked-out responses return `429` with a `Retry-After` header.
+
+A successful login clears the IP's failure history. State is in-memory (capped at 10,000 tracked IPs), so it resets on restart.
+
+By default hodor uses the TCP peer address as the client IP. If hodor runs behind another reverse proxy (a Kubernetes ingress, a load balancer), every client appears to come from the proxy's IP — one attacker could then lock out everyone. In that setup, set `TRUST_PROXY=true` so hodor uses the rightmost `X-Forwarded-For` entry (the address recorded by the proxy directly in front of it) instead. Only enable this when hodor is not directly reachable by clients, since the header is otherwise spoofable.
 
 ### Reserved Paths
 
