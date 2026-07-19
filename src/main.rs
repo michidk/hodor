@@ -402,12 +402,72 @@ async fn proxy_request(
 }
 
 fn load_config() -> Config {
-    Figment::new()
+    let env_pairs: Vec<(String, String)> = Env::raw()
+        .iter()
+        .map(|(key, value)| (key.as_str().to_string(), value))
+        .collect();
+
+    load_config_with_env(env_pairs).unwrap_or_else(|error| {
+        panic!("failed to load configuration from defaults, hodor.toml, and environment: {error}")
+    })
+}
+
+fn load_config_with_env<I, K, V>(pairs: I) -> Result<Config, String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    let mut config: Config = Figment::new()
         .merge(Serialized::defaults(Config::default()))
         .merge(Toml::file("hodor.toml"))
-        .merge(Env::raw())
         .extract()
-        .expect("failed to load configuration from defaults, hodor.toml, and environment")
+        .map_err(|error| error.to_string())?;
+
+    apply_env_overrides(&mut config, pairs)?;
+    Ok(config)
+}
+
+fn apply_env_overrides<I, K, V>(config: &mut Config, pairs: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    for (key, value) in pairs {
+        let key = key.into().trim().to_ascii_uppercase();
+        let value = value.into();
+
+        match key.as_str() {
+            "PASSWORD" => config.password = value,
+            "UPSTREAM" => config.upstream = value,
+            "LISTEN" => config.listen = value,
+            "TITLE" => config.title = value,
+            "CUSTOM_CSS" => config.custom_css = Some(value),
+            "TEMPLATE" => config.template = Some(value),
+            "ERROR_TEMPLATE" => config.error_template = Some(value),
+            "SECRET" => config.secret = Some(value),
+            "LOG_FORMAT" => config.log_format = value,
+            "SESSION_TTL" => {
+                config.session_ttl = value
+                    .parse::<u64>()
+                    .map_err(|error| format!("SESSION_TTL must be a valid integer: {error}"))?;
+            }
+            "SECURE_COOKIE" => {
+                config.secure_cookie = value
+                    .parse::<bool>()
+                    .map_err(|error| format!("SECURE_COOKIE must be true or false: {error}"))?;
+            }
+            "TRUST_PROXY" => {
+                config.trust_proxy = value
+                    .parse::<bool>()
+                    .map_err(|error| format!("TRUST_PROXY must be true or false: {error}"))?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn load_template(template_path: Option<&str>) -> String {
@@ -982,7 +1042,6 @@ fn websocket_not_supported(state: &AppState) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn test_secret() -> Vec<u8> {
         b"test-secret-key-for-unit-tests".to_vec()
     }
@@ -1676,5 +1735,40 @@ mod tests {
         )
         .unwrap();
         assert!(!html.contains("<script>xss</script>"));
+    }
+
+    #[test]
+    fn load_config_with_env_preserves_numeric_password_text() {
+        let config =
+            load_config_with_env([("PASSWORD", "123"), ("UPSTREAM", "http://localhost:3000")])
+                .expect("numeric PASSWORD from env should deserialize as a string");
+
+        assert_eq!(config.password, "123");
+    }
+
+    #[test]
+    fn load_config_with_env_preserves_decimal_password_text() {
+        let config =
+            load_config_with_env([("PASSWORD", "1.0"), ("UPSTREAM", "http://localhost:3000")])
+                .expect("decimal PASSWORD from env should preserve its text");
+
+        assert_eq!(config.password, "1.0");
+    }
+
+    #[test]
+    fn load_config_with_env_still_parses_typed_overrides() {
+        let config = load_config_with_env([
+            ("PASSWORD", "123"),
+            ("UPSTREAM", "http://localhost:3000"),
+            ("SESSION_TTL", "42"),
+            ("SECURE_COOKIE", "true"),
+            ("TRUST_PROXY", "true"),
+        ])
+        .expect("typed env overrides should still parse after string-preserving password fix");
+
+        assert_eq!(config.password, "123");
+        assert_eq!(config.session_ttl, 42);
+        assert!(config.secure_cookie);
+        assert!(config.trust_proxy);
     }
 }
