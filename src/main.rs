@@ -44,6 +44,8 @@ const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 struct AppState {
     password: Vec<u8>,
     title: String,
+    custom_css: String,
+    disable_default_css: bool,
     template_source: String,
     error_template_source: String,
     secret: Vec<u8>,
@@ -66,6 +68,10 @@ struct Config {
     #[serde(default = "default_title")]
     title: String,
     #[serde(default)]
+    custom_css: Option<String>,
+    #[serde(default)]
+    disable_default_css: bool,
+    #[serde(default)]
     template: Option<String>,
     #[serde(default)]
     error_template: Option<String>,
@@ -86,6 +92,8 @@ impl Default for Config {
             upstream: String::new(),
             listen: default_listen(),
             title: default_title(),
+            custom_css: None,
+            disable_default_css: false,
             template: None,
             error_template: None,
             secret: None,
@@ -115,17 +123,31 @@ async fn main() {
         .to_string();
     let upstream_base_path = upstream.path().trim_end_matches('/').to_string();
     let listen_addr = parse_listen_addr(&config.listen);
+    let custom_css = config.custom_css.unwrap_or_default();
     let template_source = load_template(config.template.as_deref());
-    validate_template(&template_source, &config.title).expect("template must parse and render");
+    validate_template(
+        &template_source,
+        &config.title,
+        &custom_css,
+        config.disable_default_css,
+    )
+    .expect("template must parse and render");
     let error_template_source = load_error_template(config.error_template.as_deref());
-    validate_error_template(&error_template_source, &config.title)
-        .expect("error template must parse and render");
+    validate_error_template(
+        &error_template_source,
+        &config.title,
+        &custom_css,
+        config.disable_default_css,
+    )
+    .expect("error template must parse and render");
     let secret = load_secret(config.secret.as_deref());
 
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let state = AppState {
         password: config.password.into_bytes(),
         title: config.title,
+        custom_css,
+        disable_default_css: config.disable_default_css,
         template_source,
         error_template_source,
         secret,
@@ -144,6 +166,8 @@ async fn main() {
         upstream = %state.upstream,
         custom_template_loaded = config.template.is_some(),
         custom_error_template_loaded = config.error_template.is_some(),
+        custom_css_set = !state.custom_css.is_empty(),
+        disable_default_css = state.disable_default_css,
         session_ttl_secs = state.session_ttl.as_secs(),
         secure_cookie = state.secure_cookie,
         log_format = %config.log_format,
@@ -211,7 +235,7 @@ async fn login_post(
 
     if !bool::from(password.as_bytes().ct_eq(state.password.as_slice())) {
         info!(client_ip = %client_ip, success = false, rate_limited = false, "login attempt");
-        return login_page_response(&state.template_source, &state.title, true);
+        return login_page_response(&state, true);
     }
 
     let token = sign_token(&state.secret, now_unix() + state.session_ttl.as_secs());
@@ -234,7 +258,7 @@ async fn proxy_or_login(
     request: Request<Body>,
 ) -> Response<Body> {
     if !is_authenticated(request.headers(), &state.secret) {
-        return login_page_response(&state.template_source, &state.title, false);
+        return login_page_response(&state, false);
     }
 
     proxy_request(state, addr, request).await
@@ -344,14 +368,33 @@ fn load_error_template(template_path: Option<&str>) -> String {
     }
 }
 
-fn validate_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
-    render_login_page(template_source, title, false).map(|_| ())
+fn validate_template(
+    template_source: &str,
+    title: &str,
+    custom_css: &str,
+    disable_default_css: bool,
+) -> Result<(), minijinja::Error> {
+    render_login_page(
+        template_source,
+        title,
+        custom_css,
+        disable_default_css,
+        false,
+    )
+    .map(|_| ())
 }
 
-fn validate_error_template(template_source: &str, title: &str) -> Result<(), minijinja::Error> {
+fn validate_error_template(
+    template_source: &str,
+    title: &str,
+    custom_css: &str,
+    disable_default_css: bool,
+) -> Result<(), minijinja::Error> {
     render_error_page(
         template_source,
         title,
+        custom_css,
+        disable_default_css,
         StatusCode::BAD_GATEWAY,
         "Bad Gateway",
         "The upstream service could not be reached.",
@@ -362,17 +405,25 @@ fn validate_error_template(template_source: &str, title: &str) -> Result<(), min
 fn render_login_page(
     template_source: &str,
     title: &str,
+    custom_css: &str,
+    disable_default_css: bool,
     show_error: bool,
 ) -> Result<String, minijinja::Error> {
     let mut env = Environment::new();
     env.add_template(TEMPLATE_NAME, template_source)?;
-    env.get_template(TEMPLATE_NAME)?
-        .render(context!(title => title, show_error => show_error))
+    env.get_template(TEMPLATE_NAME)?.render(context!(
+        title => title,
+        custom_css => custom_css,
+        disable_default_css => disable_default_css,
+        show_error => show_error,
+    ))
 }
 
 fn render_error_page(
     template_source: &str,
     title: &str,
+    custom_css: &str,
+    disable_default_css: bool,
     status: StatusCode,
     heading: &str,
     message: &str,
@@ -381,14 +432,22 @@ fn render_error_page(
     env.add_template(ERROR_TEMPLATE_NAME, template_source)?;
     env.get_template(ERROR_TEMPLATE_NAME)?.render(context!(
         title => title,
+        custom_css => custom_css,
+        disable_default_css => disable_default_css,
         status_code => status.as_u16(),
         heading => heading,
         message => message,
     ))
 }
 
-fn login_page_response(template_source: &str, title: &str, show_error: bool) -> Response<Body> {
-    match render_login_page(template_source, title, show_error) {
+fn login_page_response(state: &AppState, show_error: bool) -> Response<Body> {
+    match render_login_page(
+        &state.template_source,
+        &state.title,
+        &state.custom_css,
+        state.disable_default_css,
+        show_error,
+    ) {
         Ok(page) => (StatusCode::UNAUTHORIZED, Html(page)).into_response(),
         Err(error) => {
             warn!(%error, "failed to render login page");
@@ -406,6 +465,8 @@ fn error_page_response(
     match render_error_page(
         &state.error_template_source,
         &state.title,
+        &state.custom_css,
+        state.disable_default_css,
         status,
         heading,
         message,
@@ -779,6 +840,8 @@ mod tests {
         AppState {
             password: b"hunter2".to_vec(),
             title: "Test".to_string(),
+            custom_css: String::new(),
+            disable_default_css: false,
             template_source: BUILTIN_TEMPLATE.to_string(),
             error_template_source: BUILTIN_ERROR_TEMPLATE.to_string(),
             secret: test_secret(),
@@ -1157,34 +1220,112 @@ mod tests {
 
     #[test]
     fn validate_template_accepts_builtin() {
-        assert!(validate_template(BUILTIN_TEMPLATE, "Test").is_ok());
+        assert!(validate_template(BUILTIN_TEMPLATE, "Test", "", false).is_ok());
     }
 
     #[test]
     fn validate_template_rejects_invalid_syntax() {
-        assert!(validate_template("{% invalid %}", "Test").is_err());
+        assert!(validate_template("{% invalid %}", "Test", "", false).is_err());
     }
 
     #[test]
     fn validate_error_template_accepts_builtin() {
-        assert!(validate_error_template(BUILTIN_ERROR_TEMPLATE, "Test").is_ok());
+        assert!(validate_error_template(BUILTIN_ERROR_TEMPLATE, "Test", "", false).is_ok());
     }
 
     #[test]
     fn validate_error_template_rejects_invalid_syntax() {
-        assert!(validate_error_template("{% invalid %}", "Test").is_err());
+        assert!(validate_error_template("{% invalid %}", "Test", "", false).is_err());
     }
 
     #[test]
     fn render_login_page_includes_title() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", false).unwrap();
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
         assert!(html.contains("My Gate"));
     }
 
     #[test]
     fn render_login_page_escapes_title() {
-        let html = render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", false).unwrap();
+        let html =
+            render_login_page(BUILTIN_TEMPLATE, "<script>xss</script>", "", false, false).unwrap();
         assert!(!html.contains("<script>xss</script>"));
+    }
+
+    #[test]
+    fn render_login_page_includes_custom_css_verbatim() {
+        let css = ".card > button { background: \"hotpink\"; }";
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", css, false, false).unwrap();
+        assert!(html.contains(css));
+    }
+
+    #[test]
+    fn render_login_page_omits_custom_css_block_when_unset() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
+        assert_eq!(html.matches("<style>").count(), 1);
+    }
+
+    #[test]
+    fn render_login_page_disable_default_css_removes_builtin_styles() {
+        let css = "body { background: hotpink; }";
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", css, true, false).unwrap();
+        assert!(!html.contains("box-sizing"));
+        assert!(html.contains(css));
+        assert_eq!(html.matches("<style>").count(), 1);
+    }
+
+    #[test]
+    fn render_login_page_keeps_builtin_styles_by_default() {
+        let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
+        assert!(html.contains("box-sizing"));
+    }
+
+    #[test]
+    fn render_error_page_disable_default_css_removes_builtin_styles() {
+        let css = "body { background: hotpink; }";
+        let html = render_error_page(
+            BUILTIN_ERROR_TEMPLATE,
+            "My Gate",
+            css,
+            true,
+            StatusCode::BAD_GATEWAY,
+            "Bad Gateway",
+            "Oops",
+        )
+        .unwrap();
+        assert!(!html.contains("box-sizing"));
+        assert!(html.contains(css));
+        assert_eq!(html.matches("<style>").count(), 1);
+    }
+
+    #[test]
+    fn render_error_page_includes_custom_css_verbatim() {
+        let css = "body { background: #1e3a5f; }";
+        let html = render_error_page(
+            BUILTIN_ERROR_TEMPLATE,
+            "My Gate",
+            css,
+            false,
+            StatusCode::BAD_GATEWAY,
+            "Bad Gateway",
+            "Oops",
+        )
+        .unwrap();
+        assert!(html.contains(css));
+    }
+
+    #[test]
+    fn render_error_page_omits_custom_css_block_when_unset() {
+        let html = render_error_page(
+            BUILTIN_ERROR_TEMPLATE,
+            "My Gate",
+            "",
+            false,
+            StatusCode::BAD_GATEWAY,
+            "Bad Gateway",
+            "Oops",
+        )
+        .unwrap();
+        assert_eq!(html.matches("<style>").count(), 1);
     }
 
     #[test]
@@ -1192,6 +1333,8 @@ mod tests {
         let html = render_error_page(
             BUILTIN_ERROR_TEMPLATE,
             "My Gate",
+            "",
+            false,
             StatusCode::BAD_GATEWAY,
             "Upstream Unavailable",
             "The downstream service could not be reached.",
@@ -1208,6 +1351,8 @@ mod tests {
         let html = render_error_page(
             BUILTIN_ERROR_TEMPLATE,
             "<script>xss</script>",
+            "",
+            false,
             StatusCode::BAD_GATEWAY,
             "Bad Gateway",
             "Oops",
