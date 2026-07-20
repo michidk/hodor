@@ -2,6 +2,8 @@
 
 A tiny reverse proxy that holds the door — put it in front of any app to gate access behind a single shared password. No users, no database, no OAuth. Just one password and a login page.
 
+![Hero image for the hodor reverse proxy](.github/images/hero.webp)
+
 ## Features
 
 - Single shared password — no user accounts, no database
