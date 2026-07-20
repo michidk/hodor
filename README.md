@@ -8,7 +8,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - Clean dark-themed login page (or bring your own with Jinja2 templates)
 - Runs as a Docker sidecar in front of any web app
 - HMAC-SHA256 signed session cookies
-- Streaming reverse proxy (handles large uploads/downloads without buffering)
+- Streaming reverse proxy (handles large proxied uploads/downloads without buffering; login forms are capped at 16 KiB)
 - Constant-time password comparison
 - Brute-force protection: per-IP rate limiting (5 attempts / 60s), escalating lockouts after repeated failures, and delayed responses to failed logins
 - Structured tracing output (compact or JSON)
@@ -43,7 +43,7 @@ docker compose up
 
 Open `http://localhost:8080` — you'll see the login page. Enter the password, and you're proxied through to the app.
 
-![Screenshot of the hodor login page](.github/images/screenshot.png)
+![Hero image for the hodor reverse proxy](.github/images/hero.webp)
 
 ## Configuration
 
@@ -57,18 +57,18 @@ Hodor uses layered configuration. Each layer overrides the previous:
 
 | Key | Env var | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `password` | `PASSWORD` | yes | | The shared password |
-| `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`) |
-| `secret` | `SECRET` | no | random | Cookie signing key. Set this to persist sessions across restarts |
+| `password` | `PASSWORD` | yes | | The shared password; must not be empty |
+| `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`); must not be empty |
+| `secret` | `SECRET` | no | random | Non-empty cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
 | `title` | `TITLE` | no | `Password Required` | Login page heading |
 | `custom_css` | `CUSTOM_CSS` | no | | Extra CSS injected after the built-in styles on the login and error pages |
 | `disable_default_css` | `DISABLE_DEFAULT_CSS` | no | `false` | Set `true` to drop the built-in styles entirely (style from scratch with `custom_css`) |
 | `template` | `TEMPLATE` | no | built-in | Path to a custom HTML login page template |
 | `error_template` | `ERROR_TEMPLATE` | no | built-in | Path to a custom HTML error page template |
-| `session_ttl` | `SESSION_TTL` | no | `86400` | Session duration in seconds (default: 24h) |
+| `session_ttl` | `SESSION_TTL` | no | `86400` | Positive session duration in seconds (default: 24h) |
 | `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
-| `trust_proxy` | `TRUST_PROXY` | no | `false` | Set `true` when hodor runs directly behind a trusted reverse proxy (e.g. a Kubernetes ingress) to rate-limit by the client IP from `X-Forwarded-For` instead of the TCP peer address |
+| `trust_proxy` | `TRUST_PROXY` | no | `false` | Set `true` only when hodor runs directly behind a trusted reverse proxy, to accept its `X-Forwarded-For` client IP and preserve its `X-Forwarded-Proto` |
 | `log_format` | `LOG_FORMAT` | no | `compact` | Tracing output format: `compact` or `json` |
 | — | `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
 
@@ -124,7 +124,7 @@ All other paths are proxied to the upstream.
 
 - Streams request and response bodies without buffering (safe for large files)
 - Sets `X-Forwarded-For` and `X-Forwarded-Proto` headers on proxied requests
-- Strips hop-by-hop headers (Connection, Transfer-Encoding, etc.)
+- Strips standard hop-by-hop headers and any additional headers named by `Connection`
 - Forwards the upstream's `Host` header
 - WebSocket proxying is not yet supported (returns 501)
 
