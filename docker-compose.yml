@@ -6,7 +6,6 @@ services:
     environment:
       PASSWORD: "changeme"
       UPSTREAM: "http://app:80"
-      SECRET: "replace-with-openssl-rand-hex-32"
     depends_on:
       - app
 

@@ -11,4 +11,6 @@ FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /src/target/release/hodor /hodor
 EXPOSE 8080
+USER 65532:65532
+HEALTHCHECK NONE
 ENTRYPOINT ["/hodor"]
