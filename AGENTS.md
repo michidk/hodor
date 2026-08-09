@@ -88,7 +88,7 @@ docker compose up                  # runs with traefik/whoami as example upstrea
 ## Work Continuity
 
 - Track multi-step work in the active task list and update it as each step finishes.
-- For work that must continue in another session, write a handoff under `.omo/` with the goal, completed steps, remaining steps, changed files, and verification evidence. If `.omo/` is unavailable, provide the equivalent handoff in the final response.
+- For work that continues in another session, prefer a handoff under `.omo/` with the goal, completed steps, remaining steps, changed files, and verification evidence. Use the final response instead when `.omo/` is unavailable.
 - Read the latest relevant handoff before resuming. Do not rely on mental notes; durable context belongs in repository-local notes.
 - When context is tight, preserve decisions, blockers, and exact next actions in the handoff before compacting or stopping.
 - Record reusable project lessons in `AGENTS.md`; keep temporary investigation details in `.omo/` and remove them when the task is complete.
