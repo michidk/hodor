@@ -296,7 +296,7 @@ cargo install cargo-llvm-cov --locked
 cargo llvm-cov --all-features --workspace --open
 ```
 
-Without `--open`, the report is written to `target/llvm-cov/html/index.html`. CI also publishes the HTML and LCOV reports as a `coverage-report` workflow artifact.
+Without `--open`, the report is written to `target/llvm-cov/html/index.html`. CI uploads the LCOV report to Codacy and publishes the HTML and LCOV reports as a `coverage-report` workflow artifact.
 
 ## Docker
 
