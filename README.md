@@ -281,6 +281,23 @@ cargo build --release
 PASSWORD=secret UPSTREAM=http://localhost:3000 ./target/release/hodor
 ```
 
+### Tests and Coverage
+
+Run the test suite:
+
+```sh
+cargo test
+```
+
+Install [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and generate an HTML coverage report:
+
+```sh
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --all-features --workspace --open
+```
+
+Without `--open`, the report is written to `target/llvm-cov/html/index.html`. CI also publishes the HTML and LCOV reports as a `coverage-report` workflow artifact.
+
 ## Docker
 
 Build locally:
