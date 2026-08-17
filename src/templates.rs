@@ -155,12 +155,3 @@ pub(crate) fn bad_gateway(state: &AppState) -> Response<Body> {
         "Hodor is running, but the downstream service could not be reached.",
     )
 }
-
-pub(crate) fn websocket_not_supported(state: &AppState) -> Response<Body> {
-    error_page_response(
-        state,
-        StatusCode::NOT_IMPLEMENTED,
-        "WebSockets Not Supported",
-        "This hodor instance does not support WebSocket proxying yet.",
-    )
-}

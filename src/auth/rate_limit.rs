@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::header::{HeaderName, HeaderValue, RETRY_AFTER};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
+use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
@@ -67,8 +68,13 @@ impl LoginRecord {
 
 // Only the rightmost X-Forwarded-For entry was written by the directly trusted
 // proxy; entries to its left remain client-controlled.
-pub(crate) fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trust_proxy: bool) -> IpAddr {
-    if !trust_proxy {
+pub(crate) fn resolve_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trust_proxy: bool,
+    trusted_proxy_cidrs: &[IpNet],
+) -> IpAddr {
+    if !is_trusted_proxy(peer, trust_proxy, trusted_proxy_cidrs) {
         return peer;
     }
     headers
@@ -77,6 +83,24 @@ pub(crate) fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trust_proxy: 
         .and_then(|value| value.rsplit(',').next())
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(peer)
+}
+
+pub(crate) fn is_trusted_proxy(
+    peer: IpAddr,
+    trust_proxy: bool,
+    trusted_proxy_cidrs: &[IpNet],
+) -> bool {
+    trust_proxy
+        && (trusted_proxy_cidrs.is_empty()
+            || trusted_proxy_cidrs
+                .iter()
+                .any(|network| network.contains(&peer)))
+}
+
+pub(crate) fn is_bypass_ip(client_ip: IpAddr, bypass_cidrs: &[IpNet]) -> bool {
+    bypass_cidrs
+        .iter()
+        .any(|network| network.contains(&client_ip))
 }
 
 pub(crate) fn check_login_attempt(state: &AppState, ip: IpAddr) -> Option<Duration> {

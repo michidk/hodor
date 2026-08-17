@@ -33,6 +33,10 @@ fn test_state(secure_cookie: bool) -> AppState {
         session_ttl: Duration::from_secs(3600),
         secure_cookie,
         trust_proxy: false,
+        trusted_proxy_cidrs: Vec::new(),
+        bypass_cidrs: Vec::new(),
+        preserve_host: false,
+        cookie_domain: None,
         login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
         client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
     }

@@ -41,6 +41,10 @@ fn load_config_with_env_still_parses_typed_overrides() {
         ("DISABLE_DEFAULT_CSS", "true"),
         ("SECURE_COOKIE", "true"),
         ("TRUST_PROXY", "true"),
+        ("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 192.168.0.0/16"),
+        ("BYPASS_CIDRS", "100.64.0.0/10, fd7a:115c:a1e0::/48"),
+        ("PRESERVE_HOST", "true"),
+        ("COOKIE_DOMAIN", ".preview.example.com"),
     ])
     .expect("typed env overrides should still parse after string-preserving password fix");
 
@@ -49,6 +53,16 @@ fn load_config_with_env_still_parses_typed_overrides() {
     assert!(config.disable_default_css);
     assert!(config.secure_cookie);
     assert!(config.trust_proxy);
+    assert_eq!(config.trusted_proxy_cidrs, ["10.0.0.0/8", "192.168.0.0/16"]);
+    assert_eq!(
+        config.bypass_cidrs,
+        ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+    );
+    assert!(config.preserve_host);
+    assert_eq!(
+        config.cookie_domain.as_deref(),
+        Some(".preview.example.com")
+    );
 }
 
 #[test]
@@ -89,4 +103,43 @@ fn load_config_with_env_rejects_zero_session_ttl() {
     .expect_err("zero SESSION_TTL should be rejected");
 
     assert_eq!(error, "SESSION_TTL must be greater than zero");
+}
+
+#[test]
+fn load_config_with_env_rejects_invalid_cidr() {
+    let error = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("BYPASS_CIDRS", "not-a-network"),
+    ])
+    .expect_err("invalid bypass CIDR should be rejected");
+
+    assert!(error.starts_with("BYPASS_CIDRS contains invalid CIDR"));
+}
+
+#[test]
+fn load_config_with_env_requires_trust_proxy_for_proxy_cidrs() {
+    let error = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("TRUSTED_PROXY_CIDRS", "10.0.0.0/8"),
+    ])
+    .expect_err("trusted proxy CIDRs without proxy trust should be rejected");
+
+    assert_eq!(
+        error,
+        "TRUST_PROXY must be true when TRUSTED_PROXY_CIDRS is configured"
+    );
+}
+
+#[test]
+fn load_config_with_env_rejects_invalid_cookie_domain() {
+    let error = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("COOKIE_DOMAIN", "preview example.com"),
+    ])
+    .expect_err("invalid cookie domain should be rejected");
+
+    assert_eq!(error, "COOKIE_DOMAIN must be a valid DNS domain");
 }

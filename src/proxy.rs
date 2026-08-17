@@ -2,13 +2,17 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{CONNECTION, HOST, HeaderName, HeaderValue, UPGRADE};
 use axum::http::{HeaderMap, Request, Response, Uri};
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::auth::{X_FORWARDED_FOR_HEADER, is_authenticated};
+use crate::auth::{
+    X_FORWARDED_FOR_HEADER, is_authenticated, is_bypass_ip, is_trusted_proxy, resolve_client_ip,
+};
 use crate::state::AppState;
-use crate::templates::{bad_gateway, login_page_response, websocket_not_supported};
+use crate::templates::{bad_gateway, login_page_response};
 
 pub(crate) const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 
@@ -32,17 +36,27 @@ pub(crate) async fn proxy_or_login(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
-    if !is_authenticated(request.headers(), &state.secret) {
+    let trusted_proxy = is_trusted_proxy(addr.ip(), state.trust_proxy, &state.trusted_proxy_cidrs);
+    let client_ip = resolve_client_ip(
+        request.headers(),
+        addr.ip(),
+        state.trust_proxy,
+        &state.trusted_proxy_cidrs,
+    );
+    if !is_bypass_ip(client_ip, &state.bypass_cidrs)
+        && !is_authenticated(request.headers(), &state.secret)
+    {
         return login_page_response(&state, false);
     }
 
-    proxy_request(state, addr, request).await
+    proxy_request(state, addr, trusted_proxy, request).await
 }
 
 async fn proxy_request(
     state: AppState,
     addr: SocketAddr,
-    request: Request<Body>,
+    trusted_proxy: bool,
+    mut request: Request<Body>,
 ) -> Response<Body> {
     let started_at = Instant::now();
     let request_method = request.method().clone();
@@ -52,16 +66,13 @@ async fn proxy_request(
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
 
+    let websocket = is_websocket_upgrade(request.headers());
+    let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
     let (parts, body) = request.into_parts();
-
-    if is_websocket_upgrade(&parts.headers) {
-        debug!(method = %request_method, path = %request_path, client_ip = %addr.ip(), "websocket upgrade requested but not supported");
-        return websocket_not_supported(&state);
-    }
 
     let path = join_paths(&state.upstream_base_path, parts.uri.path());
     let uri = build_upstream_uri(&state, &path, parts.uri.query());
-    let forwarded_proto = resolve_forwarded_proto(&parts.headers, state.trust_proxy);
+    let forwarded_proto = resolve_forwarded_proto(&parts.headers, trusted_proxy);
 
     let mut proxied = match Request::builder().method(parts.method).uri(uri).body(body) {
         Ok(request) => request,
@@ -70,24 +81,35 @@ async fn proxy_request(
 
     *proxied.version_mut() = parts.version;
 
-    copy_end_to_end_headers(&parts.headers, proxied.headers_mut(), true);
+    copy_end_to_end_headers(&parts.headers, proxied.headers_mut(), !state.preserve_host);
+    if websocket {
+        copy_upgrade_headers(&parts.headers, proxied.headers_mut());
+    }
 
-    match HeaderValue::from_str(&state.upstream_authority) {
-        Ok(host) => {
-            proxied.headers_mut().insert(HOST, host);
+    if !state.preserve_host {
+        match HeaderValue::from_str(&state.upstream_authority) {
+            Ok(host) => {
+                proxied.headers_mut().insert(HOST, host);
+            }
+            Err(_) => return bad_gateway(&state),
         }
-        Err(_) => return bad_gateway(&state),
     }
 
     append_forwarded_headers(proxied.headers_mut(), addr.ip(), forwarded_proto);
 
-    let response = match state.client.request(proxied).await {
+    let mut response = match state.client.request(proxied).await {
         Ok(response) => response,
         Err(_) => return bad_gateway(&state),
     };
 
     let status = response.status();
-    match build_downstream_response(response) {
+    if websocket && status == http::StatusCode::SWITCHING_PROTOCOLS {
+        if let Some(downstream_upgrade) = downstream_upgrade {
+            let upstream_upgrade = hyper::upgrade::on(&mut response);
+            tokio::spawn(tunnel_websocket(downstream_upgrade, upstream_upgrade));
+        }
+    }
+    match build_downstream_response(response, websocket) {
         Ok(response) => {
             info!(
                 method = %request_method,
@@ -112,13 +134,40 @@ fn copy_end_to_end_headers(source: &HeaderMap, target: &mut HeaderMap, skip_host
 
 fn build_downstream_response(
     response: hyper::Response<hyper::body::Incoming>,
+    websocket: bool,
 ) -> Result<Response<Body>, http::Error> {
     let (parts, body) = response.into_parts();
     let mut builder = Response::builder().status(parts.status);
     if let Some(headers) = builder.headers_mut() {
         copy_end_to_end_headers(&parts.headers, headers, false);
+        if websocket {
+            copy_upgrade_headers(&parts.headers, headers);
+        }
     }
     builder.body(Body::new(body))
+}
+
+fn copy_upgrade_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for name in [CONNECTION, UPGRADE] {
+        for value in source.get_all(&name) {
+            target.append(name.clone(), value.clone());
+        }
+    }
+}
+
+async fn tunnel_websocket(downstream: OnUpgrade, upstream: OnUpgrade) {
+    let (downstream, upstream) = match tokio::try_join!(downstream, upstream) {
+        Ok(upgrades) => upgrades,
+        Err(error) => {
+            debug!(%error, "websocket upgrade failed");
+            return;
+        }
+    };
+    let mut downstream = TokioIo::new(downstream);
+    let mut upstream = TokioIo::new(upstream);
+    if let Err(error) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
+        warn!(%error, "websocket tunnel closed with an error");
+    }
 }
 
 pub(crate) fn resolve_forwarded_proto(headers: &HeaderMap, trust_proxy: bool) -> ForwardedProto {

@@ -105,6 +105,15 @@ fn clear_cookie_includes_secure_flag() {
 }
 
 #[test]
+fn session_and_clear_cookies_include_configured_domain() {
+    let mut state = test_state(true);
+    state.cookie_domain = Some(".preview.example.com".to_string());
+
+    assert!(session_cookie(&state, "token123").contains("Domain=.preview.example.com"));
+    assert!(clear_cookie(&state).contains("Domain=.preview.example.com"));
+}
+
+#[test]
 fn is_authenticated_with_valid_cookie() {
     let secret = test_secret();
     let expiry = now_unix() + 3600;

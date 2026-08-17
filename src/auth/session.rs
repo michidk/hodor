@@ -41,6 +41,10 @@ pub(crate) fn session_cookie(state: &AppState, token: &str) -> String {
     if state.secure_cookie {
         cookie.push_str("; Secure");
     }
+    if let Some(domain) = state.cookie_domain.as_deref() {
+        cookie.push_str("; Domain=");
+        cookie.push_str(domain);
+    }
     cookie
 }
 
@@ -48,6 +52,10 @@ pub(crate) fn clear_cookie(state: &AppState) -> String {
     let mut cookie = format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     if state.secure_cookie {
         cookie.push_str("; Secure");
+    }
+    if let Some(domain) = state.cookie_domain.as_deref() {
+        cookie.push_str("; Domain=");
+        cookie.push_str(domain);
     }
     cookie
 }
