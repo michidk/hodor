@@ -9,7 +9,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util"] }
 axum = "0.8"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
@@ -25,3 +25,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 serde = { version = "1", features = ["derive"] }
 minijinja = "2"
+ipnet = "2"

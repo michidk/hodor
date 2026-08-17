@@ -1,5 +1,6 @@
 use axum::http::header::{HeaderName, HeaderValue, RETRY_AFTER};
 use axum::http::{HeaderMap, StatusCode};
+use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -9,8 +10,8 @@ use super::super::test_state;
 use crate::auth::{
     LOCKOUT_BASE, LOCKOUT_MAX, LOCKOUT_THRESHOLD, LoginRecord, MAX_TRACKED_IPS,
     RATE_LIMIT_ATTEMPTS, RATE_LIMIT_WINDOW, X_FORWARDED_FOR_HEADER, check_login_attempt,
-    lockout_duration, prune_login_records, record_login_failure, record_login_success,
-    resolve_client_ip, too_many_requests,
+    is_bypass_ip, is_trusted_proxy, lockout_duration, prune_login_records, record_login_failure,
+    record_login_success, resolve_client_ip, too_many_requests,
 };
 
 #[test]
@@ -158,7 +159,7 @@ fn resolve_client_ip_uses_peer_when_proxy_not_trusted() {
         HeaderValue::from_static("203.0.113.7"),
     );
     let peer: IpAddr = "10.0.0.1".parse().unwrap();
-    assert_eq!(resolve_client_ip(&headers, peer, false), peer);
+    assert_eq!(resolve_client_ip(&headers, peer, false, &[]), peer);
 }
 
 #[test]
@@ -170,20 +171,58 @@ fn resolve_client_ip_uses_rightmost_forwarded_entry() {
     );
     let peer: IpAddr = "10.0.0.1".parse().unwrap();
     let expected: IpAddr = "203.0.113.7".parse().unwrap();
-    assert_eq!(resolve_client_ip(&headers, peer, true), expected);
+    assert_eq!(resolve_client_ip(&headers, peer, true, &[]), expected);
 }
 
 #[test]
 fn resolve_client_ip_falls_back_to_peer() {
     let peer: IpAddr = "10.0.0.1".parse().unwrap();
-    assert_eq!(resolve_client_ip(&HeaderMap::new(), peer, true), peer);
+    assert_eq!(resolve_client_ip(&HeaderMap::new(), peer, true, &[]), peer);
 
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static(X_FORWARDED_FOR_HEADER),
         HeaderValue::from_static("not-an-ip"),
     );
-    assert_eq!(resolve_client_ip(&headers, peer, true), peer);
+    assert_eq!(resolve_client_ip(&headers, peer, true, &[]), peer);
+}
+
+#[test]
+fn resolve_client_ip_only_accepts_headers_from_configured_proxy_networks() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(X_FORWARDED_FOR_HEADER),
+        HeaderValue::from_static("100.100.100.100"),
+    );
+    let networks = ["10.0.0.0/8".parse::<IpNet>().unwrap()];
+    let trusted_peer: IpAddr = "10.2.3.4".parse().unwrap();
+    let untrusted_peer: IpAddr = "203.0.113.8".parse().unwrap();
+
+    assert_eq!(
+        resolve_client_ip(&headers, trusted_peer, true, &networks),
+        "100.100.100.100".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(
+        resolve_client_ip(&headers, untrusted_peer, true, &networks),
+        untrusted_peer
+    );
+    assert!(is_trusted_proxy(trusted_peer, true, &networks));
+    assert!(!is_trusted_proxy(untrusted_peer, true, &networks));
+}
+
+#[test]
+fn bypass_networks_support_ipv4_and_ipv6() {
+    let networks = [
+        "100.64.0.0/10".parse::<IpNet>().unwrap(),
+        "fd7a:115c:a1e0::/48".parse::<IpNet>().unwrap(),
+    ];
+
+    assert!(is_bypass_ip("100.100.1.2".parse().unwrap(), &networks));
+    assert!(is_bypass_ip(
+        "fd7a:115c:a1e0::1234".parse().unwrap(),
+        &networks
+    ));
+    assert!(!is_bypass_ip("203.0.113.1".parse().unwrap(), &networks));
 }
 
 #[test]

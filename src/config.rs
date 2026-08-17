@@ -27,6 +27,14 @@ pub(crate) struct Config {
     pub(crate) secure_cookie: bool,
     #[serde(default)]
     pub(crate) trust_proxy: bool,
+    #[serde(default)]
+    pub(crate) trusted_proxy_cidrs: Vec<String>,
+    #[serde(default)]
+    pub(crate) bypass_cidrs: Vec<String>,
+    #[serde(default)]
+    pub(crate) preserve_host: bool,
+    #[serde(default)]
+    pub(crate) cookie_domain: Option<String>,
     #[serde(default = "default_log_format")]
     pub(crate) log_format: String,
 }
@@ -46,6 +54,10 @@ impl Default for Config {
             session_ttl: default_session_ttl(),
             secure_cookie: false,
             trust_proxy: false,
+            trusted_proxy_cidrs: Vec::new(),
+            bypass_cidrs: Vec::new(),
+            preserve_host: false,
+            cookie_domain: None,
             log_format: default_log_format(),
         }
     }
@@ -92,6 +104,14 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.session_ttl == 0 {
         return Err("SESSION_TTL must be greater than zero".to_string());
     }
+    validate_cidrs("TRUSTED_PROXY_CIDRS", &config.trusted_proxy_cidrs)?;
+    validate_cidrs("BYPASS_CIDRS", &config.bypass_cidrs)?;
+    if !config.trusted_proxy_cidrs.is_empty() && !config.trust_proxy {
+        return Err("TRUST_PROXY must be true when TRUSTED_PROXY_CIDRS is configured".to_string());
+    }
+    if let Some(domain) = config.cookie_domain.as_deref() {
+        validate_cookie_domain(domain)?;
+    }
 
     Ok(())
 }
@@ -136,10 +156,49 @@ where
                     .parse::<bool>()
                     .map_err(|error| format!("TRUST_PROXY must be true or false: {error}"))?;
             }
+            "TRUSTED_PROXY_CIDRS" => config.trusted_proxy_cidrs = parse_csv(&value),
+            "BYPASS_CIDRS" => config.bypass_cidrs = parse_csv(&value),
+            "PRESERVE_HOST" => {
+                config.preserve_host = value
+                    .parse::<bool>()
+                    .map_err(|error| format!("PRESERVE_HOST must be true or false: {error}"))?;
+            }
+            "COOKIE_DOMAIN" => config.cookie_domain = Some(value),
             _ => {}
         }
     }
 
+    Ok(())
+}
+
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_cidrs(name: &str, cidrs: &[String]) -> Result<(), String> {
+    for cidr in cidrs {
+        cidr.parse::<ipnet::IpNet>()
+            .map_err(|error| format!("{name} contains invalid CIDR {cidr:?}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_cookie_domain(domain: &str) -> Result<(), String> {
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    if domain.is_empty()
+        || domain.starts_with('-')
+        || domain.ends_with('-')
+        || !domain
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err("COOKIE_DOMAIN must be a valid DNS domain".to_string());
+    }
     Ok(())
 }
 

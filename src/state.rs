@@ -3,6 +3,7 @@ use axum::http::Uri;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use ipnet::IpNet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,10 @@ pub(crate) struct AppState {
     pub(crate) session_ttl: Duration,
     pub(crate) secure_cookie: bool,
     pub(crate) trust_proxy: bool,
+    pub(crate) trusted_proxy_cidrs: Vec<IpNet>,
+    pub(crate) bypass_cidrs: Vec<IpNet>,
+    pub(crate) preserve_host: bool,
+    pub(crate) cookie_domain: Option<String>,
     pub(crate) login_guard: Arc<Mutex<LoginGuard>>,
     pub(crate) client: Client<HttpConnector, Body>,
 }
@@ -81,7 +86,21 @@ pub(crate) fn build_app_state(config: Config) -> AppState {
         session_ttl: Duration::from_secs(config.session_ttl),
         secure_cookie: config.secure_cookie,
         trust_proxy: config.trust_proxy,
+        trusted_proxy_cidrs: parse_cidrs(config.trusted_proxy_cidrs),
+        bypass_cidrs: parse_cidrs(config.bypass_cidrs),
+        preserve_host: config.preserve_host,
+        cookie_domain: config.cookie_domain,
         login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
         client,
     }
+}
+
+fn parse_cidrs(cidrs: Vec<String>) -> Vec<IpNet> {
+    cidrs
+        .into_iter()
+        .map(|cidr| {
+            cidr.parse()
+                .expect("CIDRs must be validated during config loading")
+        })
+        .collect()
 }

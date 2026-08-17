@@ -11,6 +11,7 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - Runs as a Docker sidecar in front of any web app
 - HMAC-SHA256 signed session cookies
 - Streaming reverse proxy (handles large proxied uploads/downloads without buffering; login forms are capped at 16 KiB)
+- WebSocket proxying
 - Constant-time password comparison
 - Brute-force protection: per-IP rate limiting (5 attempts / 60s), escalating lockouts after repeated failures, and delayed responses to failed logins
 - Structured tracing output (compact or JSON)
@@ -71,6 +72,10 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Positive session duration in seconds (default: 24h) |
 | `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
 | `trust_proxy` | `TRUST_PROXY` | no | `false` | Set `true` only when hodor runs directly behind a trusted reverse proxy, to accept its `X-Forwarded-For` client IP and preserve its `X-Forwarded-Proto` |
+| `trusted_proxy_cidrs` | `TRUSTED_PROXY_CIDRS` | no | | Comma-separated proxy networks allowed to supply forwarding headers; requires `TRUST_PROXY=true` |
+| `bypass_cidrs` | `BYPASS_CIDRS` | no | | Comma-separated client networks that bypass authentication after trusted-proxy client IP resolution |
+| `preserve_host` | `PRESERVE_HOST` | no | `false` | Preserve the original request `Host` header instead of replacing it with the upstream authority |
+| `cookie_domain` | `COOKIE_DOMAIN` | no | | Optional cookie domain, for example `.preview.example.com`, to share a login across subdomains |
 | `log_format` | `LOG_FORMAT` | no | `compact` | Tracing output format: `compact` or `json` |
 | — | `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
 
@@ -112,7 +117,9 @@ Login attempts are guarded per client IP, entirely in memory:
 
 A successful login clears the IP's failure history. State is in-memory (capped at 10,000 tracked IPs), so it resets on restart.
 
-By default hodor uses the TCP peer address as the client IP. If hodor runs behind another reverse proxy (a Kubernetes ingress, a load balancer), every client appears to come from the proxy's IP — one attacker could then lock out everyone. In that setup, set `TRUST_PROXY=true` so hodor uses the rightmost `X-Forwarded-For` entry (the address recorded by the proxy directly in front of it) instead. Only enable this when hodor is not directly reachable by clients, since the header is otherwise spoofable.
+By default hodor uses the TCP peer address as the client IP. If hodor runs behind another reverse proxy (a Kubernetes ingress, a load balancer), every client appears to come from the proxy's IP — one attacker could then lock out everyone. In that setup, set `TRUST_PROXY=true` so hodor uses the rightmost `X-Forwarded-For` entry (the address recorded by the proxy directly in front of it) instead. Set `TRUSTED_PROXY_CIDRS` as well to restrict which direct peers may supply forwarding headers. Leaving that list empty preserves the legacy behavior of trusting every direct peer when `TRUST_PROXY=true`.
+
+`BYPASS_CIDRS` skips the password gate for matching resolved client addresses. This is useful for trusted private networks, such as a Tailscale tailnet (`100.64.0.0/10`). Configure it together with a trusted reverse proxy when Hodor receives traffic through an ingress; otherwise the proxy address, rather than the original client, is evaluated.
 
 ### Reserved Paths
 
@@ -127,8 +134,8 @@ All other paths are proxied to the upstream.
 - Streams request and response bodies without buffering (safe for large files)
 - Sets `X-Forwarded-For` and `X-Forwarded-Proto` headers on proxied requests
 - Strips standard hop-by-hop headers and any additional headers named by `Connection`
-- Forwards the upstream's `Host` header
-- WebSocket proxying is not yet supported (returns 501)
+- Replaces `Host` with the upstream authority by default; set `PRESERVE_HOST=true` for host-routed upstreams
+- Proxies WebSocket upgrades bidirectionally
 
 ## Custom CSS
 
@@ -251,7 +258,7 @@ The built-in template ([`src/template.html`](src/template.html)) is a good start
 
 ## Custom Error Page
 
-Hodor also ships with a built-in styled error page for upstream failures and unsupported WebSocket upgrades. To customize it, set `error_template` to the path of an HTML file:
+Hodor also ships with a built-in styled error page for upstream failures. To customize it, set `error_template` to the path of an HTML file:
 
 ```yaml
 environment:

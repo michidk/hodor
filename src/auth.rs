@@ -16,8 +16,8 @@ use crate::state::AppState;
 use crate::templates::{internal_server_error, login_page_response};
 pub(crate) use form::{collect_body, form_value, parse_form_body, sanitize_redirect};
 pub(crate) use rate_limit::{
-    check_login_attempt, record_login_failure, record_login_success, resolve_client_ip,
-    too_many_requests,
+    check_login_attempt, is_bypass_ip, is_trusted_proxy, record_login_failure,
+    record_login_success, resolve_client_ip, too_many_requests,
 };
 pub(crate) use session::{clear_cookie, now_unix, session_cookie, sign_token};
 
@@ -50,7 +50,12 @@ pub(crate) async fn login_post(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let client_ip = resolve_client_ip(request.headers(), addr.ip(), state.trust_proxy);
+    let client_ip = resolve_client_ip(
+        request.headers(),
+        addr.ip(),
+        state.trust_proxy,
+        &state.trusted_proxy_cidrs,
+    );
 
     if let Some(retry_after) = check_login_attempt(&state, client_ip) {
         info!(client_ip = %client_ip, success = false, rate_limited = true, "login attempt");
