@@ -1,6 +1,6 @@
 [package]
 name = "hodor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Michael Lohr <michael@lohr.dev>"]
 description = "A tiny reverse proxy that gates any app behind a shared password"
