@@ -46,8 +46,6 @@ docker compose up
 
 Open `http://localhost:8080` — you'll see the login page. Enter the password, and you're proxied through to the app.
 
-![Hero image for the hodor reverse proxy](.github/images/hero.webp)
-
 ## Configuration
 
 Hodor uses layered configuration. Each layer overrides the previous:
