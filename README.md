@@ -181,74 +181,9 @@ Templates use [Jinja2 syntax](https://jinja.palletsprojects.com/) (via [minijinj
 | `custom_css` | string | The configured `custom_css` — include it with `{{ custom_css \| safe }}` to keep the override working in your template |
 | `disable_default_css` | bool | `true` when `disable_default_css` is set — custom templates can use it to gate their own base styles |
 
-### Template Example
-
-The built-in template ([`src/template.html`](src/template.html)) is a good starting point for custom designs. Here's a minimal example showing the required structure:
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title }}</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; }
-    body {
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      font-family: system-ui, sans-serif;
-      background: #f5f5f5;
-    }
-    .card {
-      width: 100%;
-      max-width: 380px;
-      background: #fff;
-      border-radius: 12px;
-      padding: 32px;
-      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.1);
-    }
-    h1 { margin-bottom: 20px; font-size: 1.4rem; }
-    input, button {
-      width: 100%;
-      padding: 10px 14px;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      font: inherit;
-    }
-    input { margin-bottom: 12px; }
-    button { background: #111; color: #fff; border: none; cursor: pointer; }
-    .error {
-      display: {% if show_error %}block{% else %}none{% endif %};
-      margin-bottom: 12px;
-      padding: 10px;
-      border-radius: 8px;
-      background: #fef2f2;
-      color: #dc2626;
-    }
-  </style>
-</head>
-<body>
-  <main class="card">
-    <h1>{{ title }}</h1>
-    <div class="error">Wrong password.</div>
-    <form method="post" action="/_gate/login">
-      <input type="hidden" name="redirect" value="/">
-      <input name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus required>
-      <button type="submit">Continue</button>
-    </form>
-  </main>
-  <script>
-    const redirect = document.querySelector('input[name="redirect"]');
-    if (redirect) redirect.value = window.location.pathname + window.location.search + window.location.hash || '/';
-  </script>
-</body>
-</html>
-```
-
 ### Template Requirements
+
+Use the built-in [`src/template.html`](src/template.html) as a starting point for custom designs.
 
 1. The form **must** POST to `/_gate/login` with a `password` field
 2. Include a `redirect` hidden field (populated via JS) so users return to the page they were trying to access
