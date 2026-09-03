@@ -46,6 +46,10 @@ docker compose up
 
 Open `http://localhost:8080` — you'll see the login page. Enter the password, and you're proxied through to the app.
 
+Example login page with `TITLE=VibePod Preview`:
+
+![Hodor login page protecting a VibePod preview](.github/images/login-example.png)
+
 ## Configuration
 
 Hodor uses layered configuration. Each layer overrides the previous:
