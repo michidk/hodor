@@ -39,6 +39,7 @@ async fn main() {
         trust_proxy = state.trust_proxy,
         trusted_proxy_cidrs = state.trusted_proxy_cidrs.len(),
         bypass_cidrs = state.bypass_cidrs.len(),
+        bypass_paths = state.bypass_paths.len(),
         preserve_host = state.preserve_host,
         cookie_domain_set = state.cookie_domain.is_some(),
         log_format,
