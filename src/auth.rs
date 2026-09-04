@@ -1,3 +1,4 @@
+mod bypass_path;
 mod form;
 mod rate_limit;
 mod session;
@@ -14,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::state::AppState;
 use crate::templates::{internal_server_error, login_page_response};
+pub(crate) use bypass_path::{BypassPath, is_bypass_path};
 pub(crate) use form::{collect_body, form_value, parse_form_body, sanitize_redirect};
 pub(crate) use rate_limit::{
     check_login_attempt, is_bypass_ip, is_trusted_proxy, record_login_failure,
@@ -64,7 +66,7 @@ pub(crate) async fn login_post(
 
     let body = match collect_body(request.into_body()).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
 
     let form = parse_form_body(&body);
@@ -97,7 +99,7 @@ pub(crate) async fn login_post(
 }
 
 #[cfg(test)]
-pub(crate) use form::{MAX_LOGIN_BODY_SIZE, decode_form_component};
+pub(crate) use form::{BodyError, MAX_LOGIN_BODY_SIZE, decode_form_component};
 #[cfg(test)]
 pub(crate) use rate_limit::{
     LOCKOUT_BASE, LOCKOUT_MAX, LOCKOUT_THRESHOLD, LoginRecord, MAX_TRACKED_IPS,

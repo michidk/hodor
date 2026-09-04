@@ -61,12 +61,29 @@ pub(crate) fn sanitize_redirect(redirect: &str) -> String {
     }
 }
 
-pub(crate) async fn collect_body(body: Body) -> Result<Bytes, Response<Body>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyError {
+    TooLarge,
+    Invalid,
+}
+
+impl IntoResponse for BodyError {
+    fn into_response(self) -> Response<Body> {
+        match self {
+            Self::TooLarge => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
+            }
+            Self::Invalid => (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
+        }
+    }
+}
+
+pub(crate) async fn collect_body(body: Body) -> Result<Bytes, BodyError> {
     match Limited::new(body, MAX_LOGIN_BODY_SIZE).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
-            Err((StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response())
+            Err(BodyError::TooLarge)
         }
-        Err(_) => Err((StatusCode::BAD_REQUEST, "invalid request body").into_response()),
+        Err(_) => Err(BodyError::Invalid),
     }
 }

@@ -1,10 +1,11 @@
 use axum::body::Body;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use hyper::body::Bytes;
 
 use crate::auth::{
-    MAX_LOGIN_BODY_SIZE, collect_body, decode_form_component, form_value, parse_form_body,
-    sanitize_redirect,
+    BodyError, MAX_LOGIN_BODY_SIZE, collect_body, decode_form_component, form_value,
+    parse_form_body, sanitize_redirect,
 };
 
 #[test]
@@ -42,11 +43,15 @@ fn parse_form_body_empty() {
 async fn collect_body_rejects_oversized_login_form() {
     let body = Body::from(vec![b'x'; MAX_LOGIN_BODY_SIZE + 1]);
 
-    let response = collect_body(body)
+    let error = collect_body(body)
         .await
         .expect_err("oversized login form should be rejected");
 
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error, BodyError::TooLarge);
+    assert_eq!(
+        error.into_response().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
 }
 
 #[tokio::test]
