@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::test_state;
 use crate::auth::X_FORWARDED_FOR_HEADER;
+use crate::auth::{BypassPath, sign_token};
 use crate::proxy::{
     ForwardedProto, X_FORWARDED_PROTO_HEADER, append_forwarded_headers, build_upstream_uri,
     is_hop_by_hop_header, is_websocket_upgrade, join_paths, proxy_or_login,
@@ -349,4 +350,105 @@ async fn read_http_headers(stream: &mut tokio::net::TcpStream) -> String {
         bytes.push(byte[0]);
     }
     String::from_utf8(bytes).unwrap().to_ascii_lowercase()
+}
+
+// Serves one request and hands back the raw request headers the upstream saw.
+async fn capture_upstream_headers(
+    configure: impl FnOnce(&mut crate::state::AppState),
+    request_line: &str,
+) -> String {
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.unwrap();
+        let headers = read_http_headers(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        headers
+    });
+
+    let mut state = test_state(false);
+    state.upstream = format!("http://{upstream_addr}").parse().unwrap();
+    state.upstream_authority = upstream_addr.to_string();
+    configure(&mut state);
+
+    let app = Router::new().fallback(proxy_or_login).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(request_line.as_bytes()).await.unwrap();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), upstream)
+        .await
+        .expect("upstream should be reached")
+        .unwrap();
+    proxy.abort();
+    observed
+}
+
+#[tokio::test]
+async fn public_path_reports_public_without_a_session() {
+    let headers = capture_upstream_headers(
+        |state| {
+            state.bypass_paths = vec![BypassPath::parse("/oauth/token").unwrap()];
+        },
+        "GET /oauth/token HTTP/1.1\r\nHost: gate.example.com\r\n\r\n",
+    )
+    .await;
+
+    assert!(headers.contains("x-hodor-auth: public"), "{headers}");
+}
+
+#[tokio::test]
+async fn bypass_cidr_reports_bypass() {
+    let headers = capture_upstream_headers(
+        |state| {
+            state.bypass_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+        },
+        "GET /dives HTTP/1.1\r\nHost: gate.example.com\r\n\r\n",
+    )
+    .await;
+
+    assert!(headers.contains("x-hodor-auth: bypass"), "{headers}");
+}
+
+#[tokio::test]
+async fn valid_session_reports_password_even_from_a_bypass_network() {
+    let token = sign_token(&super::test_secret(), crate::auth::now_unix() + 600);
+    let request =
+        format!("GET /dives HTTP/1.1\r\nHost: gate.example.com\r\nCookie: hodor={token}\r\n\r\n");
+    let headers = capture_upstream_headers(
+        |state| {
+            state.bypass_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+        },
+        &request,
+    )
+    .await;
+
+    assert!(headers.contains("x-hodor-auth: password"), "{headers}");
+}
+
+#[tokio::test]
+async fn client_supplied_auth_header_is_stripped_on_a_public_path() {
+    let headers = capture_upstream_headers(
+        |state| {
+            state.bypass_paths = vec![BypassPath::parse("/oauth/token").unwrap()];
+        },
+        "GET /oauth/token HTTP/1.1\r\nHost: gate.example.com\r\nX-Hodor-Auth: password\r\nX-Hodor-User: root\r\n\r\n",
+    )
+    .await;
+
+    assert!(headers.contains("x-hodor-auth: public"), "{headers}");
+    assert!(!headers.contains("password"), "{headers}");
+    assert!(!headers.contains("x-hodor-user"), "{headers}");
 }

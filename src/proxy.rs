@@ -9,12 +9,34 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::auth::{
-    X_FORWARDED_FOR_HEADER, is_authenticated, is_bypass_ip, is_trusted_proxy, resolve_client_ip,
+    X_FORWARDED_FOR_HEADER, is_authenticated, is_bypass_ip, is_bypass_path, is_trusted_proxy,
+    resolve_client_ip,
 };
 use crate::state::AppState;
 use crate::templates::{bad_gateway, login_page_response};
 
 pub(crate) const X_FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+pub(crate) const X_HODOR_AUTH_HEADER: &str = "x-hodor-auth";
+const HODOR_HEADER_PREFIX: &str = "x-hodor-";
+
+// How the request cleared the gate, reported to the upstream so it does not have
+// to reimplement hodor's session format to answer the same question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthMethod {
+    Password,
+    Bypass,
+    Public,
+}
+
+impl AuthMethod {
+    const fn as_header_value(self) -> HeaderValue {
+        match self {
+            Self::Password => HeaderValue::from_static("password"),
+            Self::Bypass => HeaderValue::from_static("bypass"),
+            Self::Public => HeaderValue::from_static("public"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardedProto {
@@ -43,19 +65,35 @@ pub(crate) async fn proxy_or_login(
         state.trust_proxy,
         &state.trusted_proxy_cidrs,
     );
-    if !is_bypass_ip(client_ip, &state.bypass_cidrs)
-        && !is_authenticated(request.headers(), &state.secret)
-    {
+    let Some(auth_method) = resolve_auth_method(&state, client_ip, &request) else {
         return login_page_response(&state, false);
-    }
+    };
 
-    proxy_request(state, addr, trusted_proxy, request).await
+    proxy_request(state, addr, trusted_proxy, auth_method, request).await
+}
+
+fn resolve_auth_method(
+    state: &AppState,
+    client_ip: IpAddr,
+    request: &Request<Body>,
+) -> Option<AuthMethod> {
+    if is_bypass_path(request.uri().path(), &state.bypass_paths) {
+        return Some(AuthMethod::Public);
+    }
+    if is_authenticated(request.headers(), &state.secret) {
+        return Some(AuthMethod::Password);
+    }
+    if is_bypass_ip(client_ip, &state.bypass_cidrs) {
+        return Some(AuthMethod::Bypass);
+    }
+    None
 }
 
 async fn proxy_request(
     state: AppState,
     addr: SocketAddr,
     trusted_proxy: bool,
+    auth_method: AuthMethod,
     mut request: Request<Body>,
 ) -> Response<Body> {
     let started_at = Instant::now();
@@ -85,6 +123,7 @@ async fn proxy_request(
     if websocket {
         copy_upgrade_headers(&parts.headers, proxied.headers_mut());
     }
+    overwrite_auth_headers(proxied.headers_mut(), auth_method);
 
     if !state.preserve_host {
         match HeaderValue::from_str(&state.upstream_authority) {
@@ -145,6 +184,23 @@ fn build_downstream_response(
         }
     }
     builder.body(Body::new(body))
+}
+
+// Drops any client-supplied X-Hodor-* header before setting hodor's own, so a
+// request to a public path cannot forge the authentication method upstream.
+fn overwrite_auth_headers(headers: &mut HeaderMap, auth_method: AuthMethod) {
+    let forged: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with(HODOR_HEADER_PREFIX))
+        .cloned()
+        .collect();
+    for name in forged {
+        headers.remove(&name);
+    }
+    headers.insert(
+        HeaderName::from_static(X_HODOR_AUTH_HEADER),
+        auth_method.as_header_value(),
+    );
 }
 
 fn copy_upgrade_headers(source: &HeaderMap, target: &mut HeaderMap) {

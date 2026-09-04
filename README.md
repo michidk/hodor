@@ -14,6 +14,8 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - WebSocket proxying
 - Constant-time password comparison
 - Brute-force protection: per-IP rate limiting (5 attempts / 60s), escalating lockouts after repeated failures, and delayed responses to failed logins
+- Public paths that skip the gate entirely, for health checks, webhooks, and OAuth endpoints
+- Tells the upstream how each request was authenticated via `X-Hodor-Auth`
 - Structured tracing output (compact or JSON)
 - Health check endpoint for container orchestrators
 - Graceful shutdown on SIGTERM
@@ -76,6 +78,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `trust_proxy` | `TRUST_PROXY` | no | `false` | Set `true` only when hodor runs directly behind a trusted reverse proxy, to accept its `X-Forwarded-For` client IP and preserve its `X-Forwarded-Proto` |
 | `trusted_proxy_cidrs` | `TRUSTED_PROXY_CIDRS` | no | | Comma-separated proxy networks allowed to supply forwarding headers; requires `TRUST_PROXY=true` |
 | `bypass_cidrs` | `BYPASS_CIDRS` | no | | Comma-separated client networks that bypass authentication after trusted-proxy client IP resolution |
+| `bypass_paths` | `BYPASS_PATHS` | no | | Comma-separated request paths served without authentication; exact by default, `/prefix/*` for a subtree |
 | `preserve_host` | `PRESERVE_HOST` | no | `false` | Preserve the original request `Host` header instead of replacing it with the upstream authority |
 | `cookie_domain` | `COOKIE_DOMAIN` | no | | Optional cookie domain, for example `.preview.example.com`, to share a login across subdomains |
 | `log_format` | `LOG_FORMAT` | no | `compact` | Tracing output format: `compact` or `json` |
@@ -100,8 +103,10 @@ Environment variables always win. Set `PASSWORD=override` and it takes precedenc
 ```
 Request → hodor
   ├─ /_gate/health → 200 ok (bypass auth)
-  ├─ Has valid session cookie? → Reverse proxy to UPSTREAM
-  └─ No cookie? → Show login page
+  ├─ Path in BYPASS_PATHS? → Reverse proxy to UPSTREAM (X-Hodor-Auth: public)
+  ├─ Has valid session cookie? → Reverse proxy to UPSTREAM (X-Hodor-Auth: password)
+  ├─ Client IP in BYPASS_CIDRS? → Reverse proxy to UPSTREAM (X-Hodor-Auth: bypass)
+  └─ Otherwise? → Show login page
        └─ POST /_gate/login
             ├─ Rate limited or locked out? → 429 (with Retry-After)
             ├─ Password correct? → Set cookie, redirect back
@@ -122,6 +127,58 @@ A successful login clears the IP's failure history. State is in-memory (capped a
 By default hodor uses the TCP peer address as the client IP. If hodor runs behind another reverse proxy (a Kubernetes ingress, a load balancer), every client appears to come from the proxy's IP — one attacker could then lock out everyone. In that setup, set `TRUST_PROXY=true` so hodor uses the rightmost `X-Forwarded-For` entry (the address recorded by the proxy directly in front of it) instead. Set `TRUSTED_PROXY_CIDRS` as well to restrict which direct peers may supply forwarding headers. Leaving that list empty preserves the legacy behavior of trusting every direct peer when `TRUST_PROXY=true`.
 
 `BYPASS_CIDRS` skips the password gate for matching resolved client addresses. This is useful for trusted private networks, such as a Tailscale tailnet (`100.64.0.0/10`). Configure it together with a trusted reverse proxy when Hodor receives traffic through an ingress; otherwise the proxy address, rather than the original client, is evaluated.
+
+### Public Paths
+
+`BYPASS_PATHS` serves specific paths without authentication, which is useful for
+endpoints a machine has to reach directly: webhooks, metrics, or the OAuth
+discovery and token endpoints an API needs alongside a browser-facing app. It
+replaces the common workaround of routing those paths around hodor with a second
+ingress, so the upstream keeps receiving hodor's forwarded headers.
+
+Entries match the request path only — never the query string — and are exact
+unless they end in `/*`:
+
+```sh
+BYPASS_PATHS=/api/mcp,/oauth/token,/static/*
+```
+
+- `/api/mcp` matches only `/api/mcp`, not `/api/mcp/tools`.
+- `/static/*` matches `/static/` and everything beneath it, but not `/static`.
+- `*` is only accepted as a trailing `/*` segment; `/a*b` and `/a/*/b` are
+  rejected at startup, so a typo cannot silently widen access.
+
+A path is matched only when it is already canonical. Requests containing `.` or
+`..` segments, duplicate slashes, or the percent-encoded forms `%2e`, `%2f`, and
+`%25` never match a public path and fall through to the password gate. Hodor
+forwards the client's raw path, so this keeps its decision from disagreeing with
+an upstream that normalises differently — `/static/../secret` cannot be smuggled
+past the gate.
+
+Public paths cannot shadow the reserved `/_gate/*` routes.
+
+### Forwarded Authentication
+
+Every proxied request carries `X-Hodor-Auth`, telling the upstream how the
+request cleared the gate:
+
+| Value | Meaning |
+| --- | --- |
+| `password` | Presented a valid session cookie |
+| `bypass` | Matched `BYPASS_CIDRS` |
+| `public` | Matched `BYPASS_PATHS`; not authenticated |
+
+Read this header instead of parsing hodor's session cookie. The cookie format is
+an internal detail, and an app that re-implements the HMAC check needs a copy of
+`SECRET` and breaks if the format changes. The header also lets an app tell a
+password-authenticated visitor from one admitted by network trust, so it can
+accept `bypass` for reads while demanding `password` for a destructive action.
+
+Any client-supplied `X-Hodor-*` header is removed before hodor sets its own, so
+the value cannot be forged — including on public paths, which are otherwise the
+obvious place to try. As with any forwarded-authentication proxy, this holds only
+while the upstream is reachable exclusively through hodor; bind it to loopback or
+a private network so nothing can bypass the gate and set the header itself.
 
 ### Reserved Paths
 

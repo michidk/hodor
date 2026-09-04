@@ -3,6 +3,8 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+use crate::auth::BypassPath;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Config {
     pub(crate) password: String,
@@ -32,6 +34,8 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) bypass_cidrs: Vec<String>,
     #[serde(default)]
+    pub(crate) bypass_paths: Vec<String>,
+    #[serde(default)]
     pub(crate) preserve_host: bool,
     #[serde(default)]
     pub(crate) cookie_domain: Option<String>,
@@ -56,6 +60,7 @@ impl Default for Config {
             trust_proxy: false,
             trusted_proxy_cidrs: Vec::new(),
             bypass_cidrs: Vec::new(),
+            bypass_paths: Vec::new(),
             preserve_host: false,
             cookie_domain: None,
             log_format: default_log_format(),
@@ -106,6 +111,7 @@ fn validate_config(config: &Config) -> Result<(), String> {
     }
     validate_cidrs("TRUSTED_PROXY_CIDRS", &config.trusted_proxy_cidrs)?;
     validate_cidrs("BYPASS_CIDRS", &config.bypass_cidrs)?;
+    validate_bypass_paths(&config.bypass_paths)?;
     if !config.trusted_proxy_cidrs.is_empty() && !config.trust_proxy {
         return Err("TRUST_PROXY must be true when TRUSTED_PROXY_CIDRS is configured".to_string());
     }
@@ -158,6 +164,7 @@ where
             }
             "TRUSTED_PROXY_CIDRS" => config.trusted_proxy_cidrs = parse_csv(&value),
             "BYPASS_CIDRS" => config.bypass_cidrs = parse_csv(&value),
+            "BYPASS_PATHS" => config.bypass_paths = parse_csv(&value),
             "PRESERVE_HOST" => {
                 config.preserve_host = value
                     .parse::<bool>()
@@ -184,6 +191,13 @@ fn validate_cidrs(name: &str, cidrs: &[String]) -> Result<(), String> {
     for cidr in cidrs {
         cidr.parse::<ipnet::IpNet>()
             .map_err(|error| format!("{name} contains invalid CIDR {cidr:?}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_bypass_paths(paths: &[String]) -> Result<(), String> {
+    for path in paths {
+        BypassPath::parse(path).map_err(|error| format!("BYPASS_PATHS {error}"))?;
     }
     Ok(())
 }

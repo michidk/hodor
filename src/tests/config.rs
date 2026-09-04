@@ -143,3 +143,53 @@ fn load_config_with_env_rejects_invalid_cookie_domain() {
 
     assert_eq!(error, "COOKIE_DOMAIN must be a valid DNS domain");
 }
+
+#[test]
+fn load_config_with_env_parses_bypass_paths() {
+    let config = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("BYPASS_PATHS", "/api/mcp, /oauth/token, /static/*"),
+    ])
+    .expect("valid bypass paths should parse");
+
+    assert_eq!(
+        config.bypass_paths,
+        ["/api/mcp", "/oauth/token", "/static/*"]
+    );
+}
+
+#[test]
+fn load_config_with_env_defaults_bypass_paths_to_empty() {
+    let config = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+    ])
+    .expect("config without bypass paths should parse");
+
+    assert!(config.bypass_paths.is_empty());
+}
+
+#[test]
+fn load_config_with_env_rejects_relative_bypass_path() {
+    let error = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("BYPASS_PATHS", "api/mcp"),
+    ])
+    .expect_err("bypass path without a leading slash should be rejected");
+
+    assert!(error.starts_with("BYPASS_PATHS"), "{error}");
+}
+
+#[test]
+fn load_config_with_env_rejects_interior_wildcard() {
+    let error = load_config_with_env([
+        ("PASSWORD", "hunter2"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("BYPASS_PATHS", "/a/*/b"),
+    ])
+    .expect_err("interior wildcard should be rejected");
+
+    assert!(error.starts_with("BYPASS_PATHS"), "{error}");
+}

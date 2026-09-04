@@ -7,7 +7,7 @@ use ipnet::IpNet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::auth::{LoginGuard, load_secret};
+use crate::auth::{BypassPath, LoginGuard, load_secret};
 use crate::config::Config;
 use crate::templates::{
     load_error_template, load_template, validate_error_template, validate_template,
@@ -31,6 +31,7 @@ pub(crate) struct AppState {
     pub(crate) trust_proxy: bool,
     pub(crate) trusted_proxy_cidrs: Vec<IpNet>,
     pub(crate) bypass_cidrs: Vec<IpNet>,
+    pub(crate) bypass_paths: Vec<BypassPath>,
     pub(crate) preserve_host: bool,
     pub(crate) cookie_domain: Option<String>,
     pub(crate) login_guard: Arc<Mutex<LoginGuard>>,
@@ -88,11 +89,21 @@ pub(crate) fn build_app_state(config: Config) -> AppState {
         trust_proxy: config.trust_proxy,
         trusted_proxy_cidrs: parse_cidrs(config.trusted_proxy_cidrs),
         bypass_cidrs: parse_cidrs(config.bypass_cidrs),
+        bypass_paths: parse_bypass_paths(config.bypass_paths),
         preserve_host: config.preserve_host,
         cookie_domain: config.cookie_domain,
         login_guard: Arc::new(Mutex::new(LoginGuard::new(Instant::now()))),
         client,
     }
+}
+
+fn parse_bypass_paths(paths: Vec<String>) -> Vec<BypassPath> {
+    paths
+        .into_iter()
+        .map(|path| {
+            BypassPath::parse(&path).expect("bypass paths must be validated during config loading")
+        })
+        .collect()
 }
 
 fn parse_cidrs(cidrs: Vec<String>) -> Vec<IpNet> {
