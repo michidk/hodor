@@ -25,6 +25,10 @@ pub(crate) struct Config {
     pub(crate) secret: Option<String>,
     #[serde(default = "default_session_ttl")]
     pub(crate) session_ttl: u64,
+    #[serde(default = "default_upstream_connect_timeout")]
+    pub(crate) upstream_connect_timeout: u64,
+    #[serde(default = "default_upstream_header_timeout")]
+    pub(crate) upstream_header_timeout: u64,
     #[serde(default)]
     pub(crate) secure_cookie: bool,
     #[serde(default)]
@@ -56,6 +60,8 @@ impl Default for Config {
             error_template: None,
             secret: None,
             session_ttl: default_session_ttl(),
+            upstream_connect_timeout: default_upstream_connect_timeout(),
+            upstream_header_timeout: default_upstream_header_timeout(),
             secure_cookie: false,
             trust_proxy: false,
             trusted_proxy_cidrs: Vec::new(),
@@ -109,6 +115,12 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.session_ttl == 0 {
         return Err("SESSION_TTL must be greater than zero".to_string());
     }
+    if config.upstream_connect_timeout == 0 {
+        return Err("UPSTREAM_CONNECT_TIMEOUT must be greater than zero".to_string());
+    }
+    if config.upstream_header_timeout == 0 {
+        return Err("UPSTREAM_HEADER_TIMEOUT must be greater than zero".to_string());
+    }
     validate_cidrs("TRUSTED_PROXY_CIDRS", &config.trusted_proxy_cidrs)?;
     validate_cidrs("BYPASS_CIDRS", &config.bypass_cidrs)?;
     validate_bypass_paths(&config.bypass_paths)?;
@@ -146,6 +158,16 @@ where
                 config.session_ttl = value
                     .parse::<u64>()
                     .map_err(|error| format!("SESSION_TTL must be a valid integer: {error}"))?;
+            }
+            "UPSTREAM_CONNECT_TIMEOUT" => {
+                config.upstream_connect_timeout = value.parse::<u64>().map_err(|error| {
+                    format!("UPSTREAM_CONNECT_TIMEOUT must be a valid integer: {error}")
+                })?;
+            }
+            "UPSTREAM_HEADER_TIMEOUT" => {
+                config.upstream_header_timeout = value.parse::<u64>().map_err(|error| {
+                    format!("UPSTREAM_HEADER_TIMEOUT must be a valid integer: {error}")
+                })?;
             }
             "DISABLE_DEFAULT_CSS" => {
                 config.disable_default_css = value.parse::<bool>().map_err(|error| {
@@ -237,6 +259,14 @@ fn default_title() -> String {
 
 fn default_session_ttl() -> u64 {
     86_400
+}
+
+fn default_upstream_connect_timeout() -> u64 {
+    10
+}
+
+fn default_upstream_header_timeout() -> u64 {
+    30
 }
 
 pub(crate) fn default_log_format() -> String {

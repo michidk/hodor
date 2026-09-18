@@ -27,6 +27,7 @@ pub(crate) struct AppState {
     pub(crate) upstream_authority: String,
     pub(crate) upstream_base_path: String,
     pub(crate) session_ttl: Duration,
+    pub(crate) upstream_header_timeout: Duration,
     pub(crate) secure_cookie: bool,
     pub(crate) trust_proxy: bool,
     pub(crate) trusted_proxy_cidrs: Vec<IpNet>,
@@ -71,7 +72,9 @@ pub(crate) fn build_app_state(config: Config) -> AppState {
     .expect("error template must parse and render");
     let secret = load_secret(config.secret.as_deref());
 
-    let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(Duration::from_secs(config.upstream_connect_timeout)));
+    let client = Client::builder(TokioExecutor::new()).build(connector);
     AppState {
         password: config.password.into_bytes(),
         title: config.title,
@@ -85,6 +88,7 @@ pub(crate) fn build_app_state(config: Config) -> AppState {
         upstream_authority,
         upstream_base_path,
         session_ttl: Duration::from_secs(config.session_ttl),
+        upstream_header_timeout: Duration::from_secs(config.upstream_header_timeout),
         secure_cookie: config.secure_cookie,
         trust_proxy: config.trust_proxy,
         trusted_proxy_cidrs: parse_cidrs(config.trusted_proxy_cidrs),

@@ -342,6 +342,54 @@ async fn proxy_preserves_host_and_tunnels_websocket_bytes() {
     upstream.await.unwrap();
 }
 
+#[tokio::test]
+async fn proxy_times_out_waiting_for_upstream_response_headers() {
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.unwrap();
+        let _headers = read_http_headers(&mut stream).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    });
+
+    let mut state = test_state(false);
+    state.upstream = format!("http://{upstream_addr}").parse().unwrap();
+    state.upstream_authority = upstream_addr.to_string();
+    state.bypass_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+    state.upstream_header_timeout = std::time::Duration::from_millis(50);
+
+    let app = Router::new().fallback(proxy_or_login).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: gate.example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        read_http_headers(&mut client),
+    )
+    .await
+    .expect("proxy should return before the stalled upstream responds");
+
+    assert!(
+        response.starts_with("http/1.1 502 bad gateway"),
+        "{response}"
+    );
+    proxy.abort();
+    upstream.abort();
+}
+
 async fn read_http_headers(stream: &mut tokio::net::TcpStream) -> String {
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {

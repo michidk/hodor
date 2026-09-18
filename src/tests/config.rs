@@ -38,6 +38,8 @@ fn load_config_with_env_still_parses_typed_overrides() {
         ("PASSWORD", "123"),
         ("UPSTREAM", "http://localhost:3000"),
         ("SESSION_TTL", "42"),
+        ("UPSTREAM_CONNECT_TIMEOUT", "7"),
+        ("UPSTREAM_HEADER_TIMEOUT", "19"),
         ("DISABLE_DEFAULT_CSS", "true"),
         ("SECURE_COOKIE", "true"),
         ("TRUST_PROXY", "true"),
@@ -50,6 +52,8 @@ fn load_config_with_env_still_parses_typed_overrides() {
 
     assert_eq!(config.password, "123");
     assert_eq!(config.session_ttl, 42);
+    assert_eq!(config.upstream_connect_timeout, 7);
+    assert_eq!(config.upstream_header_timeout, 19);
     assert!(config.disable_default_css);
     assert!(config.secure_cookie);
     assert!(config.trust_proxy);
@@ -103,6 +107,29 @@ fn load_config_with_env_rejects_zero_session_ttl() {
     .expect_err("zero SESSION_TTL should be rejected");
 
     assert_eq!(error, "SESSION_TTL must be greater than zero");
+}
+
+#[test]
+fn load_config_with_env_rejects_zero_upstream_timeouts() {
+    for (name, expected) in [
+        (
+            "UPSTREAM_CONNECT_TIMEOUT",
+            "UPSTREAM_CONNECT_TIMEOUT must be greater than zero",
+        ),
+        (
+            "UPSTREAM_HEADER_TIMEOUT",
+            "UPSTREAM_HEADER_TIMEOUT must be greater than zero",
+        ),
+    ] {
+        let error = load_config_with_env([
+            ("PASSWORD", "hunter2"),
+            ("UPSTREAM", "http://localhost:3000"),
+            (name, "0"),
+        ])
+        .expect_err("zero upstream timeout should be rejected");
+
+        assert_eq!(error, expected);
+    }
 }
 
 #[test]

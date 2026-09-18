@@ -31,6 +31,7 @@ fn test_state(secure_cookie: bool) -> AppState {
         upstream_authority: "localhost:3000".to_string(),
         upstream_base_path: String::new(),
         session_ttl: Duration::from_secs(3600),
+        upstream_header_timeout: Duration::from_secs(30),
         secure_cookie,
         trust_proxy: false,
         trusted_proxy_cidrs: Vec::new(),

@@ -74,6 +74,8 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `template` | `TEMPLATE` | no | built-in | Path to a custom HTML login page template |
 | `error_template` | `ERROR_TEMPLATE` | no | built-in | Path to a custom HTML error page template |
 | `session_ttl` | `SESSION_TTL` | no | `86400` | Positive session duration in seconds (default: 24h) |
+| `upstream_connect_timeout` | `UPSTREAM_CONNECT_TIMEOUT` | no | `10` | Positive timeout in seconds for establishing an upstream connection |
+| `upstream_header_timeout` | `UPSTREAM_HEADER_TIMEOUT` | no | `30` | Positive timeout in seconds for receiving upstream response headers; response bodies continue streaming without this deadline |
 | `secure_cookie` | `SECURE_COOKIE` | no | `false` | Set `true` to add the `Secure` flag to cookies (requires HTTPS) |
 | `trust_proxy` | `TRUST_PROXY` | no | `false` | Set `true` only when hodor runs directly behind a trusted reverse proxy, to accept its `X-Forwarded-For` client IP and preserve its `X-Forwarded-Proto` |
 | `trusted_proxy_cidrs` | `TRUSTED_PROXY_CIDRS` | no | | Comma-separated proxy networks allowed to supply forwarding headers; requires `TRUST_PROXY=true` |

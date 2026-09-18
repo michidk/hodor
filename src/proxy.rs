@@ -136,10 +136,22 @@ async fn proxy_request(
 
     append_forwarded_headers(proxied.headers_mut(), addr.ip(), forwarded_proto);
 
-    let mut response = match state.client.request(proxied).await {
-        Ok(response) => response,
-        Err(_) => return bad_gateway(&state),
-    };
+    let mut response =
+        match tokio::time::timeout(state.upstream_header_timeout, state.client.request(proxied))
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return bad_gateway(&state),
+            Err(_) => {
+                warn!(
+                    method = %request_method,
+                    path = %request_path,
+                    timeout_secs = state.upstream_header_timeout.as_secs(),
+                    "upstream response headers timed out"
+                );
+                return bad_gateway(&state);
+            }
+        };
 
     let status = response.status();
     if websocket && status == http::StatusCode::SWITCHING_PROTOCOLS {

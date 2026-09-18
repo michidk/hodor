@@ -16,6 +16,15 @@ use config::{default_log_format, load_config, parse_listen_addr};
 use proxy::proxy_or_login;
 use state::build_app_state;
 
+fn app(state: state::AppState) -> Router {
+    Router::new()
+        .route("/_gate/login", get(login_get).post(login_post))
+        .route("/_gate/logout", get(logout))
+        .route("/_gate/health", get(health))
+        .fallback(proxy_or_login)
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     init_tracing(&std::env::var("LOG_FORMAT").unwrap_or_else(|_| default_log_format()));
@@ -46,12 +55,7 @@ async fn main() {
         "starting hodor"
     );
 
-    let app = Router::new()
-        .route("/_gate/login", get(login_get).post(login_post))
-        .route("/_gate/logout", get(logout))
-        .route("/_gate/health", get(health))
-        .fallback(proxy_or_login)
-        .with_state(state);
+    let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
