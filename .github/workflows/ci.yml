@@ -64,7 +64,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@212e92b595ceefa6daaad2cda95b921ed5da4cd4 # cargo-llvm-cov
+        uses: taiki-e/install-action@6db3a280da9eee4283c045c7431ab5116f1a0089 # cargo-llvm-cov
 
       - name: Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
