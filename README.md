@@ -32,9 +32,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PASSWORD: "changeme"                          # the login password
+      PASSWORD: "${PASSWORD:?set PASSWORD}"     # the login password
       UPSTREAM: "http://app:80"
-      SECRET: "changeme"                              # signs session cookies (generate with: openssl rand -hex 32)
+      SECRET: "${SECRET:?set SECRET}"           # signs session cookies
     depends_on:
       - app
 
@@ -43,8 +43,12 @@ services:
 ```
 
 ```sh
+export PASSWORD='choose-a-strong-password'
+export SECRET="$(openssl rand -hex 32)"
 docker compose up
 ```
+
+Compose refuses to start until both values are set. Never reuse example values for a deployment that is reachable by others.
 
 Open `http://localhost:8080` — you'll see the login page. Enter the password, and you're proxied through to the app.
 
@@ -65,7 +69,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | Key | Env var | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `password` | `PASSWORD` | yes | | The shared password; must not be empty |
-| `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`); must not be empty |
+| `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`); must not be empty. Upstream connections are plain HTTP only — `https://` upstreams are not supported, so terminate TLS before hodor's upstream connection |
 | `secret` | `SECRET` | no | random | Non-empty cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
 | `title` | `TITLE` | no | `Password Required` | Login page heading |
@@ -90,9 +94,9 @@ Hodor uses layered configuration. Each layer overrides the previous:
 
 ```toml
 # hodor.toml
-password = "changeme"
+password = "<your-password>"           # replace before use
 upstream = "http://app:3000"
-secret = "changeme" # generate with: openssl rand -hex 32
+secret = "<output of openssl rand -hex 32>" # replace before use
 title = "Restricted Area"
 session_ttl = 3600
 secure_cookie = true
@@ -122,6 +126,7 @@ Login attempts are guarded per client IP, entirely in memory:
 - **Rate limiting** — at most 5 attempts per 60 seconds per IP.
 - **Escalating lockouts** — after 10 consecutive failed attempts, the IP is locked out for 60 seconds; each further failure doubles the lockout, up to 1 hour.
 - **Failure delay** — every failed attempt is answered after a 500ms delay to slow down online guessing.
+- **Body deadline** — login form bodies must arrive within 10 seconds, or the request is answered with `408`.
 - **`Retry-After`** — rate-limited and locked-out responses return `429` with a `Retry-After` header.
 
 A successful login clears the IP's failure history. State is in-memory (capped at 10,000 tracked IPs), so it resets on restart.
@@ -186,7 +191,7 @@ a private network so nothing can bypass the gate and set the header itself.
 
 - `/_gate/login` — login form submission (POST) / redirect to gate (GET)
 - `/_gate/logout` — clears session cookie
-- `/_gate/health` — returns `ok` (for liveness/readiness probes)
+- `/_gate/health` — returns `ok` (process liveness only; it does not check the upstream)
 
 All other paths are proxied to the upstream.
 
@@ -312,7 +317,7 @@ docker run -e PASSWORD=secret -e UPSTREAM=http://host.docker.internal:3000 -p 80
 
 ### Health Checks
 
-Hodor exposes `/_gate/health` which returns `200 ok` — use it for liveness and readiness probes.
+Hodor exposes `/_gate/health` which returns `200 ok` whenever the hodor process is serving HTTP. It does not check the upstream, so use it as a liveness probe; for end-to-end readiness, probe a proxied path listed in `BYPASS_PATHS` instead.
 
 Since hodor runs from a `scratch` image, there's no shell or utilities inside the container. Use an external probe or your orchestrator's native HTTP health check:
 

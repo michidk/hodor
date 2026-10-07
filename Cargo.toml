@@ -26,3 +26,6 @@ figment = { version = "0.10", features = ["toml", "env"] }
 serde = { version = "1", features = ["derive"] }
 minijinja = "2"
 ipnet = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

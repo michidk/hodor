@@ -4,7 +4,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PASSWORD: "changeme"
+      PASSWORD: "${PASSWORD:?set PASSWORD to a unique login password}"
       UPSTREAM: "http://app:80"
     depends_on:
       - app

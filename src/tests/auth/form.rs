@@ -1,11 +1,14 @@
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Frame};
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::auth::{
-    BodyError, MAX_LOGIN_BODY_SIZE, collect_body, decode_form_component, form_value,
-    parse_form_body, sanitize_redirect,
+    BodyError, LOGIN_BODY_TIMEOUT, MAX_LOGIN_BODY_SIZE, collect_body, decode_form_component,
+    form_value, parse_form_body, sanitize_redirect,
 };
 
 #[test]
@@ -63,6 +66,33 @@ async fn collect_body_accepts_login_form_at_limit() {
         .expect("login form at size limit should be accepted");
 
     assert_eq!(collected.len(), MAX_LOGIN_BODY_SIZE);
+}
+
+struct StalledBody;
+
+impl hyper::body::Body for StalledBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Pending
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collect_body_times_out_stalled_login_form() {
+    let started_at = tokio::time::Instant::now();
+
+    let error = collect_body(Body::new(StalledBody))
+        .await
+        .expect_err("stalled login form should time out");
+
+    assert_eq!(error, BodyError::Timeout);
+    assert_eq!(started_at.elapsed(), LOGIN_BODY_TIMEOUT);
+    assert_eq!(error.into_response().status(), StatusCode::REQUEST_TIMEOUT);
 }
 
 #[test]

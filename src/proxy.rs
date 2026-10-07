@@ -141,7 +141,16 @@ async fn proxy_request(
             .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => return bad_gateway(&state),
+            Ok(Err(error)) => {
+                warn!(
+                    method = %request_method,
+                    path = %request_path,
+                    duration_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "upstream request failed"
+                );
+                return bad_gateway(&state);
+            }
             Err(_) => {
                 warn!(
                     method = %request_method,

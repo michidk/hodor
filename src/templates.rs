@@ -152,6 +152,6 @@ pub(crate) fn bad_gateway(state: &AppState) -> Response<Body> {
         state,
         StatusCode::BAD_GATEWAY,
         "Upstream Unavailable",
-        "Hodor is running, but the downstream service could not be reached.",
+        "Hodor is running, but the upstream service could not be reached.",
     )
 }

@@ -124,13 +124,13 @@ fn render_error_page_includes_fields() {
         false,
         StatusCode::BAD_GATEWAY,
         "Upstream Unavailable",
-        "The downstream service could not be reached.",
+        "The upstream service could not be reached.",
     )
     .unwrap();
     assert!(html.contains("My Gate"));
     assert!(html.contains("502"));
     assert!(html.contains("Upstream Unavailable"));
-    assert!(html.contains("The downstream service could not be reached."));
+    assert!(html.contains("The upstream service could not be reached."));
 }
 
 #[test]

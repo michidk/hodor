@@ -99,7 +99,7 @@ pub(crate) async fn login_post(
 }
 
 #[cfg(test)]
-pub(crate) use form::{BodyError, MAX_LOGIN_BODY_SIZE, decode_form_component};
+pub(crate) use form::{BodyError, LOGIN_BODY_TIMEOUT, MAX_LOGIN_BODY_SIZE, decode_form_component};
 #[cfg(test)]
 pub(crate) use rate_limit::{
     LOCKOUT_BASE, LOCKOUT_MAX, LOCKOUT_THRESHOLD, LoginRecord, MAX_TRACKED_IPS,

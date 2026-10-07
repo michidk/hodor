@@ -23,7 +23,7 @@ Single-binary HTTP server built on axum + hyper. `src/main.rs` wires the server,
 - **Session tokens**: `<unix_expiry>|<hmac_sha256(expiry)>` — signed with SECRET. Internal; upstreams read `X-Hodor-Auth` instead of parsing the cookie
 - **Forwarded auth**: every proxied request gets `X-Hodor-Auth: password|bypass|public`. Client-supplied `X-Hodor-*` headers are stripped first, so the value cannot be forged — keep that strip unconditional and ahead of the auth decision
 - **Public paths**: `BYPASS_PATHS` matches the path only, exact unless it ends in `/*`. Non-canonical paths (dot segments, `//`, `%2e`/`%2f`/`%25`) deliberately fail closed into the gate rather than being normalised, because hodor forwards the raw path
-- **Brute-force protection**: in-memory `HashMap<IpAddr, LoginRecord>` behind `Arc<Mutex<_>>` — sliding-window rate limit (5 attempts / 60s per IP), escalating lockouts after 10 consecutive failures (60s doubling per failure, capped at 1h), 500ms delay on failed attempts, `Retry-After` on 429s, capped at 10k tracked IPs with oldest-entry eviction. Client IP is the TCP peer address, or the rightmost `X-Forwarded-For` entry when `TRUST_PROXY=true`
+- **Brute-force protection**: in-memory `HashMap<IpAddr, LoginRecord>` behind `Arc<Mutex<_>>` — sliding-window rate limit (5 attempts / 60s per IP), escalating lockouts after 10 consecutive failures (60s doubling per failure, capped at 1h), 500ms delay on failed attempts, 10s deadline for collecting the login body, `Retry-After` on 429s, capped at 10k tracked IPs with oldest-entry eviction. Client IP is the TCP peer address, or the rightmost `X-Forwarded-For` entry when `TRUST_PROXY=true`
 - **Template system**: Jinja2 templates via minijinja. Built-in login template in `src/template.html` and error template in `src/error_template.html` (both embedded via `include_str!`). Custom templates via `TEMPLATE`/`ERROR_TEMPLATE` config; extra CSS via `CUSTOM_CSS` (injected after the built-in styles, unescaped); `DISABLE_DEFAULT_CSS` drops the built-in styles entirely. Login variables: `title`, `show_error`, `custom_css`, `disable_default_css`. Error variables: `title`, `status_code`, `heading`, `message`, `custom_css`, `disable_default_css`.
 - **Proxy**: streaming (bodies are not buffered in memory), sets `X-Forwarded-For`/`X-Forwarded-Proto`, strips hop-by-hop headers
 
@@ -56,7 +56,7 @@ Docker:
 
 ```sh
 docker build -t hodor .
-docker compose up                  # runs with traefik/whoami as example upstream
+PASSWORD=... docker compose up     # runs with traefik/whoami as example upstream; PASSWORD is required
 ```
 
 ## CI/CD

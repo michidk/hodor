@@ -3,8 +3,10 @@ use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Bytes;
+use std::time::Duration;
 
 pub(crate) const MAX_LOGIN_BODY_SIZE: usize = 16 * 1024;
+pub(crate) const LOGIN_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn parse_form_body(body: &Bytes) -> Vec<(String, String)> {
     String::from_utf8_lossy(body)
@@ -65,6 +67,7 @@ pub(crate) fn sanitize_redirect(redirect: &str) -> String {
 pub(crate) enum BodyError {
     TooLarge,
     Invalid,
+    Timeout,
 }
 
 impl IntoResponse for BodyError {
@@ -74,12 +77,21 @@ impl IntoResponse for BodyError {
                 (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
             }
             Self::Invalid => (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
+            Self::Timeout => {
+                (StatusCode::REQUEST_TIMEOUT, "request body timed out").into_response()
+            }
         }
     }
 }
 
 pub(crate) async fn collect_body(body: Body) -> Result<Bytes, BodyError> {
-    match Limited::new(body, MAX_LOGIN_BODY_SIZE).collect().await {
+    let collected = tokio::time::timeout(
+        LOGIN_BODY_TIMEOUT,
+        Limited::new(body, MAX_LOGIN_BODY_SIZE).collect(),
+    )
+    .await
+    .map_err(|_| BodyError::Timeout)?;
+    match collected {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
             Err(BodyError::TooLarge)

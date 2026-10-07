@@ -12,7 +12,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use auth::{health, login_get, login_post, logout};
-use config::{default_log_format, load_config, parse_listen_addr};
+use config::{load_config, parse_listen_addr};
 use proxy::proxy_or_login;
 use state::build_app_state;
 
@@ -27,9 +27,9 @@ fn app(state: state::AppState) -> Router {
 
 #[tokio::main]
 async fn main() {
-    init_tracing(&std::env::var("LOG_FORMAT").unwrap_or_else(|_| default_log_format()));
-
     let config = load_config();
+    init_tracing(&config.log_format);
+
     let listen_addr = parse_listen_addr(&config.listen);
     let custom_template_loaded = config.template.is_some();
     let custom_error_template_loaded = config.error_template.is_some();
