@@ -26,6 +26,20 @@ fn validate_error_template_rejects_invalid_syntax() {
 }
 
 #[test]
+fn login_error_is_only_rendered_after_failure_even_without_styles() {
+    for disable_css in [false, true] {
+        let html = render_login_page(BUILTIN_TEMPLATE, "Gate", "", disable_css, false).unwrap();
+        assert!(!html.contains("Wrong password."));
+        assert!(!html.contains("aria-invalid=\"true\""));
+
+        let html = render_login_page(BUILTIN_TEMPLATE, "Gate", "", disable_css, true).unwrap();
+        assert!(html.find("</form>").unwrap() < html.find("Wrong password.").unwrap());
+        assert!(html.contains("role=\"alert\""));
+        assert!(html.contains("aria-describedby=\"password-error\""));
+    }
+}
+
+#[test]
 fn render_login_page_includes_title() {
     let html = render_login_page(BUILTIN_TEMPLATE, "My Gate", "", false, false).unwrap();
     assert!(html.contains("My Gate"));
