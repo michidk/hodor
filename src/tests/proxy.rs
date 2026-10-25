@@ -277,7 +277,7 @@ fn resolve_forwarded_proto_ignores_untrusted_value() {
 }
 
 #[tokio::test]
-async fn proxy_preserves_host_and_tunnels_websocket_bytes() {
+async fn authenticated_websocket_relays_frames_and_close() {
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream = tokio::spawn(async move {
@@ -286,23 +286,33 @@ async fn proxy_preserves_host_and_tunnels_websocket_bytes() {
         assert!(headers.contains("host: preview.example.com"));
         assert!(headers.contains("connection: upgrade"));
         assert!(headers.contains("upgrade: websocket"));
+        assert!(headers.contains("x-hodor-auth: password"));
+        assert!(headers.contains("x-forwarded-for: 127.0.0.1"));
+        assert!(headers.contains("x-forwarded-proto: http"));
+        assert!(headers.contains("sec-websocket-key: dghlihnhbxbszsbub25jzq=="));
 
         stream
             .write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
             )
             .await
             .unwrap();
-        let mut payload = [0_u8; 4];
-        stream.read_exact(&mut payload).await.unwrap();
-        stream.write_all(&payload).await.unwrap();
+        let mut frame = [0_u8; 8];
+        stream.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, [0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]);
+        stream.write_all(&[0x81, 2, b'h', b'i']).await.unwrap();
+        let mut close = [0_u8; 8];
+        stream.read_exact(&mut close).await.unwrap();
+        assert_eq!(close, [0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2]);
+        stream.write_all(&[0x88, 2, 0x03, 0xe8]).await.unwrap();
+        stream.shutdown().await.unwrap();
     });
 
     let mut state = test_state(false);
     state.upstream = format!("http://{upstream_addr}").parse().unwrap();
     state.upstream_authority = upstream_addr.to_string();
     state.preserve_host = true;
-    state.bypass_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+    let token = sign_token(&state.secret, crate::auth::now_unix() + 600);
 
     let app = Router::new()
         .route("/_gate/health", get(|| async { "ok" }))
@@ -323,17 +333,22 @@ async fn proxy_preserves_host_and_tunnels_websocket_bytes() {
         let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
         client
             .write_all(
-                b"GET /socket HTTP/1.1\r\nHost: preview.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                format!("GET /socket HTTP/1.1\r\nHost: preview.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: hodor={token}\r\n\r\n").as_bytes(),
             )
             .await
             .unwrap();
         let response = read_http_headers(&mut client).await;
         assert!(response.starts_with("http/1.1 101 switching protocols"));
 
-        client.write_all(b"ping").await.unwrap();
+        assert!(response.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="));
+        client.write_all(&[0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]).await.unwrap();
         let mut echoed = [0_u8; 4];
         client.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
+        assert_eq!(echoed, [0x81, 2, b'h', b'i']);
+        client.write_all(&[0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2]).await.unwrap();
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, [0x88, 2, 0x03, 0xe8]);
+        assert_eq!(client.read(&mut echoed).await.unwrap(), 0);
     })
     .await;
 
@@ -540,4 +555,66 @@ async fn unset_upstream_header_preserves_client_authorization() {
     )
     .await;
     assert!(headers.contains("authorization: bearer client-token\r\n"));
+}
+
+#[tokio::test]
+async fn unauthenticated_websocket_does_not_reach_upstream() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut state = test_state(false);
+    state.upstream_authority = upstream.local_addr().unwrap().to_string();
+    state.upstream = format!("http://{}", state.upstream_authority)
+        .parse()
+        .unwrap();
+    let response = proxy_or_login(
+        axum::extract::State(state),
+        axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+        axum::http::Request::builder()
+            .uri("/socket")
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    assert!(!response.headers().contains_key(UPGRADE));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("action=\"/_gate/login\""));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn authenticated_websocket_upstream_failure_returns_bad_gateway() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut state = test_state(false);
+    state.upstream_authority = upstream.local_addr().unwrap().to_string();
+    state.upstream = format!("http://{}", state.upstream_authority)
+        .parse()
+        .unwrap();
+    let token = sign_token(&state.secret, crate::auth::now_unix() + 600);
+    let failure = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        drop(stream);
+    });
+    let response = proxy_or_login(
+        axum::extract::State(state),
+        axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+        axum::http::Request::builder()
+            .uri("/socket")
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .header("cookie", format!("hodor={token}"))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+    assert!(!response.headers().contains_key(UPGRADE));
+    failure.await.unwrap();
 }
