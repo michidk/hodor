@@ -278,35 +278,7 @@ fn resolve_forwarded_proto_ignores_untrusted_value() {
 
 #[tokio::test]
 async fn authenticated_websocket_relays_frames_and_close() {
-    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream_listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move {
-        let (mut stream, _) = upstream_listener.accept().await.unwrap();
-        let headers = read_http_headers(&mut stream).await;
-        assert!(headers.contains("host: preview.example.com"));
-        assert!(headers.contains("connection: upgrade"));
-        assert!(headers.contains("upgrade: websocket"));
-        assert!(headers.contains("x-hodor-auth: password"));
-        assert!(headers.contains("x-forwarded-for: 127.0.0.1"));
-        assert!(headers.contains("x-forwarded-proto: http"));
-        assert!(headers.contains("sec-websocket-key: dghlihnhbxbszsbub25jzq=="));
-
-        stream
-            .write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut frame = [0_u8; 8];
-        stream.read_exact(&mut frame).await.unwrap();
-        assert_eq!(frame, [0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]);
-        stream.write_all(&[0x81, 2, b'h', b'i']).await.unwrap();
-        let mut close = [0_u8; 8];
-        stream.read_exact(&mut close).await.unwrap();
-        assert_eq!(close, [0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2]);
-        stream.write_all(&[0x88, 2, 0x03, 0xe8]).await.unwrap();
-        stream.shutdown().await.unwrap();
-    });
+    let (upstream_addr, upstream) = spawn_websocket_upstream().await;
 
     let mut state = test_state(false);
     state.upstream = format!("http://{upstream_addr}").parse().unwrap();
@@ -334,6 +306,36 @@ async fn authenticated_websocket_relays_frames_and_close() {
     proxy.abort();
     exchange.expect("WebSocket exchange should complete");
     upstream.await.unwrap();
+}
+
+async fn spawn_websocket_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let headers = read_http_headers(&mut stream).await;
+        for expected in [
+            "host: preview.example.com",
+            "connection: upgrade",
+            "upgrade: websocket",
+            "x-hodor-auth: password",
+            "x-forwarded-for: 127.0.0.1",
+            "x-forwarded-proto: http",
+            "sec-websocket-key: dghlihnhbxbszsbub25jzq==",
+        ] {
+            assert!(headers.contains(expected), "missing {expected}: {headers}");
+        }
+        stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n").await.unwrap();
+        let mut frame = [0_u8; 8];
+        stream.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, [0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]);
+        stream.write_all(&[0x81, 2, b'h', b'i']).await.unwrap();
+        stream.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, [0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2]);
+        stream.write_all(&[0x88, 2, 0x03, 0xe8]).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    (address, server)
 }
 
 async fn websocket_client_exchange(proxy_addr: SocketAddr, token: &str) -> Result<(), String> {
