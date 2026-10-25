@@ -220,3 +220,54 @@ fn load_config_with_env_rejects_interior_wildcard() {
 
     assert!(error.starts_with("BYPASS_PATHS"), "{error}");
 }
+
+#[test]
+fn upstream_header_preserves_colons_and_supports_toml() {
+    let config = load_config_with_env([
+        ("PASSWORD", "test"),
+        ("UPSTREAM", "http://localhost:3000"),
+        ("UPSTREAM_HEADER", "Authorization: Bearer test:token"),
+    ])
+    .unwrap();
+    let state = crate::state::build_app_state(config);
+    let (name, value) = state.upstream_header.unwrap();
+    assert_eq!(name, "authorization");
+    assert_eq!(value, "Bearer test:token");
+
+    use figment::providers::{Format, Toml};
+    let config: crate::config::Config = figment::Figment::new()
+        .merge(Toml::string("password = 'test'\nupstream = 'http://localhost:3000'\nupstream_header = 'X-Api-Key: test-key'"))
+        .extract()
+        .unwrap();
+    let state = crate::state::build_app_state(config);
+    let (name, value) = state.upstream_header.unwrap();
+    assert_eq!(name, "x-api-key");
+    assert_eq!(value, "test-key");
+}
+
+#[test]
+fn upstream_header_rejects_malformed_or_reserved_headers_without_echoing_values() {
+    for header in [
+        "private-test-value",
+        ": private-test-value",
+        "Bad Name: private-test-value",
+        "X-Test: private-test-value\r\nInjected: yes",
+        "X-Hodor-Auth: private-test-value",
+        "x-HODOR-user: private-test-value",
+        "X-Forwarded-For: private-test-value",
+        "Host: private-test-value",
+        "Content-Length: private-test-value",
+        "Connection: private-test-value",
+        "Transfer-Encoding: private-test-value",
+        "Upgrade: private-test-value",
+    ] {
+        let error = load_config_with_env([
+            ("PASSWORD", "test"),
+            ("UPSTREAM", "http://localhost:3000"),
+            ("UPSTREAM_HEADER", header),
+        ])
+        .unwrap_err();
+        assert!(error.starts_with("UPSTREAM_HEADER"));
+        assert!(!error.contains("private-test-value"));
+    }
+}

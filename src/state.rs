@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::Uri;
+use axum::http::header::{HeaderName, HeaderValue};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -8,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{BypassPath, LoginGuard, load_secret};
-use crate::config::Config;
+use crate::config::{Config, parse_upstream_header};
 use crate::templates::{
     load_error_template, load_template, validate_error_template, validate_template,
 };
@@ -23,6 +24,7 @@ pub(crate) struct AppState {
     pub(crate) error_template_source: String,
     pub(crate) secret: Vec<u8>,
     pub(crate) upstream: Uri,
+    pub(crate) upstream_header: Option<(HeaderName, HeaderValue)>,
     pub(crate) upstream_scheme: String,
     pub(crate) upstream_authority: String,
     pub(crate) upstream_base_path: String,
@@ -84,6 +86,10 @@ pub(crate) fn build_app_state(config: Config) -> AppState {
         error_template_source,
         secret,
         upstream,
+        upstream_header: config.upstream_header.as_deref().map(|header| {
+            parse_upstream_header(header)
+                .expect("upstream header must be validated during config loading")
+        }),
         upstream_scheme,
         upstream_authority,
         upstream_base_path,

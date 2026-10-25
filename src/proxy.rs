@@ -123,6 +123,9 @@ async fn proxy_request(
     if websocket {
         copy_upgrade_headers(&parts.headers, proxied.headers_mut());
     }
+    if let Some((name, value)) = &state.upstream_header {
+        proxied.headers_mut().insert(name.clone(), value.clone());
+    }
     overwrite_auth_headers(proxied.headers_mut(), auth_method);
 
     if !state.preserve_host {

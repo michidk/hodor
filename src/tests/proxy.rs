@@ -500,3 +500,44 @@ async fn client_supplied_auth_header_is_stripped_on_a_public_path() {
     assert!(!headers.contains("password"), "{headers}");
     assert!(!headers.contains("x-hodor-user"), "{headers}");
 }
+
+#[tokio::test]
+async fn configured_header_replaces_all_client_values_for_each_auth_method() {
+    let token = sign_token(&super::test_secret(), crate::auth::now_unix() + 600);
+    for auth in ["password", "bypass", "public"] {
+        let request = format!(
+            "GET /api HTTP/1.1\r\nHost: gate.example.com\r\nAuthorization: client-one\r\nAuthorization: client-two\r\nConnection: Authorization\r\nX-Hodor-Auth: forged\r\nCookie: hodor={}\r\n\r\n",
+            if auth == "password" { &token } else { "" }
+        );
+        let headers = capture_upstream_headers(
+            |state| {
+                state.upstream_header = Some(
+                    crate::config::parse_upstream_header("Authorization: Bearer test:token")
+                        .unwrap(),
+                );
+                if auth == "public" {
+                    state.bypass_paths = vec![BypassPath::parse("/api").unwrap()];
+                } else if auth == "bypass" {
+                    state.bypass_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+                }
+            },
+            &request,
+        )
+        .await;
+        assert_eq!(headers.matches("authorization:").count(), 1);
+        assert!(headers.contains("authorization: bearer test:token\r\n"));
+        assert!(!headers.contains("client-one"));
+        assert!(!headers.contains("client-two"));
+        assert!(headers.contains(&format!("x-hodor-auth: {auth}\r\n")));
+    }
+}
+
+#[tokio::test]
+async fn unset_upstream_header_preserves_client_authorization() {
+    let headers = capture_upstream_headers(
+        |state| state.bypass_paths = vec![BypassPath::parse("/api").unwrap()],
+        "GET /api HTTP/1.1\r\nHost: gate.example.com\r\nAuthorization: Bearer client-token\r\n\r\n",
+    )
+    .await;
+    assert!(headers.contains("authorization: bearer client-token\r\n"));
+}

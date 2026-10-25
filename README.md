@@ -70,6 +70,7 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | --- | --- | --- | --- | --- |
 | `password` | `PASSWORD` | yes | | The shared password; must not be empty |
 | `upstream` | `UPSTREAM` | yes | | Backend URL to proxy to (e.g. `http://app:3000`); must not be empty. Upstream connections are plain HTTP only — `https://` upstreams are not supported, so terminate TLS before hodor's upstream connection |
+| `upstream_header` | `UPSTREAM_HEADER` | no | | Static request header as `Name: value`, replacing any client values. See below for reserved headers |
 | `secret` | `SECRET` | no | random | Non-empty cookie signing key. Set this to persist sessions across restarts |
 | `listen` | `LISTEN` | no | `:8080` | Listen address |
 | `title` | `TITLE` | no | `Password Required` | Login page heading |
@@ -89,6 +90,25 @@ Hodor uses layered configuration. Each layer overrides the previous:
 | `cookie_domain` | `COOKIE_DOMAIN` | no | | Optional cookie domain, for example `.preview.example.com`, to share a login across subdomains |
 | `log_format` | `LOG_FORMAT` | no | `compact` | Tracing output format: `compact` or `json` |
 | — | `RUST_LOG` | no | `info` | Log level filter (e.g. `debug`, `hodor=trace`) |
+
+### Static upstream header
+
+Set `UPSTREAM_HEADER` to send a static header on every proxied request, including
+public paths, network bypasses, and WebSocket handshakes:
+
+```yaml
+environment:
+  UPSTREAM_HEADER: "Authorization: Bearer <your-upstream-token>"
+```
+
+The equivalent TOML setting is `upstream_header = "Authorization: Bearer <your-upstream-token>"`.
+Only one header is supported. The configured value replaces all client-supplied
+values for that header. Requests that show the login page never reach the upstream.
+Keep tokens private and restrict direct access to the upstream.
+
+Invalid headers fail startup without printing their contents. `X-Hodor-*`,
+`X-Forwarded-*`, `Host`, `Content-Length`, and hop-by-hop headers are reserved
+and cannot be configured through this option.
 
 ### Config File Example
 

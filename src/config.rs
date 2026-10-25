@@ -1,3 +1,4 @@
+use axum::http::header::{HeaderName, HeaderValue};
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,8 @@ use crate::auth::BypassPath;
 pub(crate) struct Config {
     pub(crate) password: String,
     pub(crate) upstream: String,
+    #[serde(default)]
+    pub(crate) upstream_header: Option<String>,
     #[serde(default = "default_listen")]
     pub(crate) listen: String,
     #[serde(default = "default_title")]
@@ -52,6 +55,7 @@ impl Default for Config {
         Self {
             password: String::new(),
             upstream: String::new(),
+            upstream_header: None,
             listen: default_listen(),
             title: default_title(),
             custom_css: None,
@@ -121,6 +125,9 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.upstream_header_timeout == 0 {
         return Err("UPSTREAM_HEADER_TIMEOUT must be greater than zero".to_string());
     }
+    if let Some(header) = &config.upstream_header {
+        parse_upstream_header(header)?;
+    }
     validate_cidrs("TRUSTED_PROXY_CIDRS", &config.trusted_proxy_cidrs)?;
     validate_cidrs("BYPASS_CIDRS", &config.bypass_cidrs)?;
     validate_bypass_paths(&config.bypass_paths)?;
@@ -147,6 +154,7 @@ where
         match key.as_str() {
             "PASSWORD" => config.password = value,
             "UPSTREAM" => config.upstream = value,
+            "UPSTREAM_HEADER" => config.upstream_header = Some(value),
             "LISTEN" => config.listen = value,
             "TITLE" => config.title = value,
             "CUSTOM_CSS" => config.custom_css = Some(value),
@@ -271,4 +279,32 @@ fn default_upstream_header_timeout() -> u64 {
 
 pub(crate) fn default_log_format() -> String {
     "compact".to_string()
+}
+
+pub(crate) fn parse_upstream_header(header: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let invalid = || "UPSTREAM_HEADER must contain a valid Name: value header".to_string();
+    let (name, value) = header.split_once(':').ok_or_else(invalid)?;
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?;
+    let value = HeaderValue::from_str(value.trim_matches([' ', '\t'])).map_err(|_| invalid())?;
+    if name.as_str().starts_with("x-hodor-")
+        || name.as_str().starts_with("x-forwarded-")
+        || matches!(
+            name.as_str(),
+            "host"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
+    {
+        return Err(
+            "UPSTREAM_HEADER cannot override proxy protocol or X-Hodor-* headers".to_string(),
+        );
+    }
+    Ok((name, value))
 }

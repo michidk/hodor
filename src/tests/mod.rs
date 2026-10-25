@@ -27,6 +27,7 @@ fn test_state(secure_cookie: bool) -> AppState {
         error_template_source: BUILTIN_ERROR_TEMPLATE.to_string(),
         secret: test_secret(),
         upstream: "http://localhost:3000".parse().unwrap(),
+        upstream_header: None,
         upstream_scheme: "http".to_string(),
         upstream_authority: "localhost:3000".to_string(),
         upstream_base_path: String::new(),
