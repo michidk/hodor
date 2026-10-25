@@ -223,6 +223,14 @@ All other paths are proxied to the upstream.
 - Replaces `Host` with the upstream authority by default; set `PRESERVE_HOST=true` for host-routed upstreams
 - Proxies WebSocket upgrades bidirectionally
 
+WebSocket handshakes use the same session cookie and bypass rules as HTTP
+requests. Without a valid session or a matching bypass rule, Hodor returns the
+login page and does not contact the upstream. After a successful HTTP/1.1
+upgrade, Hodor relays frames and connection closure in both directions.
+Forwarded headers and `UPSTREAM_HEADER` also apply to the handshake. Upstream
+connection failures return `502`; upstream handshake rejections retain their
+HTTP status.
+
 ## Custom CSS
 
 To restyle the built-in login and error pages without maintaining a full template, set `custom_css`. It is injected into a `<style>` tag after the built-in styles, so your rules take precedence:
