@@ -329,17 +329,20 @@ async fn authenticated_websocket_relays_frames_and_close() {
         .unwrap();
     });
 
+    let exchange = websocket_client_exchange(proxy_addr, &token).await;
+
+    proxy.abort();
+    exchange.expect("WebSocket exchange should complete");
+    upstream.await.unwrap();
+}
+
+async fn websocket_client_exchange(proxy_addr: SocketAddr, token: &str) -> Result<(), String> {
     let exchange = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
-        client
-            .write_all(
-                format!("GET /socket HTTP/1.1\r\nHost: preview.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: hodor={token}\r\n\r\n").as_bytes(),
-            )
-            .await
-            .unwrap();
+        let request = format!("GET /socket HTTP/1.1\r\nHost: preview.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: hodor={token}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
         let response = read_http_headers(&mut client).await;
         assert!(response.starts_with("http/1.1 101 switching protocols"));
-
         assert!(response.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="));
         client.write_all(&[0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]).await.unwrap();
         let mut echoed = [0_u8; 4];
@@ -349,12 +352,8 @@ async fn authenticated_websocket_relays_frames_and_close() {
         client.read_exact(&mut echoed).await.unwrap();
         assert_eq!(echoed, [0x88, 2, 0x03, 0xe8]);
         assert_eq!(client.read(&mut echoed).await.unwrap(), 0);
-    })
-    .await;
-
-    proxy.abort();
-    exchange.expect("WebSocket exchange should complete");
-    upstream.await.unwrap();
+    }).await;
+    exchange.map_err(|_| "WebSocket exchange timed out".to_string())
 }
 
 #[tokio::test]
