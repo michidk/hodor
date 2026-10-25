@@ -2,74 +2,161 @@
 # template: rust/bump-version
 # @end-orcastrate
 
-name: Bump Version
+name: Bump Version & Tag
 
-# checkov:skip=CKV_GHA_7: The choice only selects a constrained semantic-version increment.
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: "Version bump type"
+      bump_type:
+        description: Version bump type
         required: true
         type: choice
+        default: patch
         options:
+          - auto
           - patch
           - minor
           - major
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: bump-version-${{ github.repository }}
+  cancel-in-progress: false
 
 defaults:
   run:
     shell: bash
 
-jobs:
-  bump:
-    name: Bump version and tag
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.HODOR_TOKEN }}
+env:
+  BUMP_TYPE: ${{ inputs.bump_type }}
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  RELEASE_TOKEN_SECRET: RELEASE_TOKEN
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+jobs:
+  bump-and-tag:
+    name: Bump version and create tag
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Validate branch and token
+        env:
+          RELEASE_TOKEN: ${{ secrets[env.RELEASE_TOKEN_SECRET] }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo '::error::Run this workflow on the default branch.'
+            exit 1
+          fi
+          if [[ -z "$RELEASE_TOKEN" ]]; then
+            printf '::error::Set %s to a token with Contents and Workflows write access to this repository.\n' "$RELEASE_TOKEN_SECRET"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets[env.RELEASE_TOKEN_SECRET] }}
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - name: Determine automatic version bump
+        if: ${{ inputs.bump_type == 'auto' }}
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
+        with:
+          config: cliff.toml
+          args: --bumped-version --output /tmp/git-cliff-changelog.md
+
+      - name: Calculate next version and check tag
+        id: version
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          versions=()
+
+          versions+=("$(jq -er --arg manifest 'Cargo.toml' \
+            '.packages[] | select(.manifest_path == (env.GITHUB_WORKSPACE + "/" + $manifest)) | .version' <<< "$metadata")")
+
+          current="$(printf '%s\n' "${versions[@]}" | sort -u)"
+          if [[ "$current" == *$'\n'* || -z "$current" ]]; then
+            echo '::error::Release packages must share the same version.'
+            exit 1
+          fi
+          if [[ ! "$current" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo '::error::The current Cargo version must be a stable X.Y.Z version.'
+            exit 1
+          fi
+          if [[ "$BUMP_TYPE" == auto ]]; then
+            VERSION="$("$RUNNER_TEMP/git-cliff/bin/git-cliff" --bumped-version)"
+          else
+            IFS=. read -r major minor patch <<< "$current"
+            case "$BUMP_TYPE" in
+              patch) ((patch += 1)) ;;
+              minor) ((minor += 1)); patch=0 ;;
+              major) ((major += 1)); minor=0; patch=0 ;;
+              *)
+                echo '::error::Expected auto, patch, minor, or major.'
+                exit 1
+                ;;
+            esac
+            VERSION="$major.$minor.$patch"
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo '::error::git-cliff did not produce a stable X.Y.Z version.'
+            exit 1
+          fi
+          if [[ "$current" != "$VERSION" && "$(printf '%s\n' "$current" "$VERSION" | sort -V | head -1)" != "$current" ]]; then
+            echo '::error::The calculated version is older than the current Cargo version.'
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            if [[ "$current" == "$VERSION" && "$(git rev-parse "v$VERSION^{commit}")" == "$(git rev-parse HEAD)" ]]; then
+              echo 'Version and tag already exist; nothing to do.'
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo '::error::The next version tag already exists.'
+            exit 1
+          fi
 
       - name: Install cargo-edit
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        if: steps.version.outputs.skip != 'true'
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
-          tool: cargo-edit
+          tool: cargo-edit@0.13.13
 
-      - name: Get current version
-        id: current
+      - name: Update package version without upgrading dependencies
+        if: steps.version.outputs.skip != 'true'
         run: |
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$version" >> $GITHUB_OUTPUT
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          packages=()
 
-      - name: Bump version in Cargo.toml
-        run: cargo set-version --bump ${{ inputs.bump }}
+          packages+=(--package "$(jq -er --arg manifest 'Cargo.toml' \
+            '.packages[] | select(.manifest_path == (env.GITHUB_WORKSPACE + "/" + $manifest)) | .name' <<< "$metadata")")
 
-      - name: Get new version
-        id: new
+          cargo set-version "${packages[@]}" "$VERSION"
+          cargo update --workspace
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+
+          actual="$(jq -er --arg manifest 'Cargo.toml' \
+            '.packages[] | select(.manifest_path == (env.GITHUB_WORKSPACE + "/" + $manifest)) | .version' <<< "$metadata")"
+          if [[ "$actual" != "$VERSION" ]]; then
+            echo '::error::Cargo version does not match the requested version.'
+            exit 1
+          fi
+
+
+      - name: Commit and atomically push version and tag
+        if: steps.version.outputs.skip != 'true'
         run: |
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "tag=v$version" >> $GITHUB_OUTPUT
-
-      - name: Commit and tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): ${{ steps.new.outputs.tag }}"
-          git tag "${{ steps.new.outputs.tag }}"
-          git push origin main --tags
-
-      - name: Summary
-        run: |
-          echo "### Version Bumped" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**${{ steps.current.outputs.version }}** → **${{ steps.new.outputs.version }}** (${{ inputs.bump }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Tag \`${{ steps.new.outputs.tag }}\` pushed — release workflow will build and publish." >> $GITHUB_STEP_SUMMARY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- Cargo.toml Cargo.lock ':(glob)**/Cargo.toml'
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): v$VERSION"
+          fi
+          git tag "v$VERSION"
+          git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/v$VERSION"
