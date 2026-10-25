@@ -40,10 +40,10 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Compile
         run: cargo test --no-run
@@ -59,7 +59,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: llvm-tools-preview
 
@@ -67,7 +67,7 @@ jobs:
         uses: taiki-e/install-action@32e16a23c68a001a1621efca19f131f965d4d122 # cargo-llvm-cov
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Generate coverage report
         run: cargo llvm-cov --all-features --workspace --html
@@ -78,7 +78,7 @@ jobs:
       - name: Upload coverage to Codacy
         uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
         with:
-          api-token: ${{ secrets.CODACY_API_TOKEN }}
+          project-token: ${{ secrets.CODACY_API_TOKEN }}
           coverage-reports: target/llvm-cov/lcov.info
 
       - name: Upload coverage report
@@ -96,12 +96,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check --color always
