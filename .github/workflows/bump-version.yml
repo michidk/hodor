@@ -1,3 +1,7 @@
+# @orcastrate
+# template: rust/bump-version
+# @end-orcastrate
+
 name: Bump Version
 
 # checkov:skip=CKV_GHA_7: The choice only selects a constrained semantic-version increment.
