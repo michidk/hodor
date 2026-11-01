@@ -28,4 +28,4 @@ minijinja = "3"
 ipnet = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "=1.54.1", features = ["test-util"] }
