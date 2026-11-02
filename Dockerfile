@@ -1,4 +1,4 @@
-FROM rust:1-alpine AS build
+FROM rust:1-alpine@sha256:7e9e2d068a107a2adafd19930011178d14a78326053cd4c3a9f7ad3fd049557d AS build
 # hadolint ignore=DL3018
 RUN apk add --no-cache musl-dev
 WORKDIR /src
