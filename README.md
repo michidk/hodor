@@ -2,7 +2,11 @@
 
 A tiny reverse proxy that holds the door — put it in front of any app to gate access behind a single shared password. No users, no database, no OAuth. Just one password and a login page.
 
-![Hero image for the hodor reverse proxy](.github/images/hero.webp)
+<p align="center"><a href="#quick-start">Quick start</a> · <a href="#configuration">Configuration</a> · <a href="#forwarded-authentication">Authentication</a></p>
+
+<p align="center"><a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a></p>
+
+<p align="center"><img src=".github/images/hero.webp" width="800" alt="Hodor reverse proxy illustration"></p>
 
 ## Features
 
@@ -23,6 +27,8 @@ A tiny reverse proxy that holds the door — put it in front of any app to gate 
 - Built with Rust, runs from a `scratch` image (~5MB)
 
 ## Quick Start
+
+Save this as `docker-compose.yml` in an empty directory:
 
 ```yaml
 # docker-compose.yml
@@ -54,7 +60,7 @@ Open `http://localhost:8080` — you'll see the login page. Enter the password, 
 
 Example login page with `TITLE=VibePod Preview`:
 
-![Hodor login page protecting a VibePod preview](.github/images/login-example.png)
+<p align="center"><img src=".github/images/login-example.png" width="720" alt="Hodor login page protecting a VibePod preview"></p>
 
 ## Configuration
 
